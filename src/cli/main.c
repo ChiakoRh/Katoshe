@@ -7,6 +7,7 @@
 #include "archive.h"
 #include "config.h"
 #include "download.h"
+#include "env.h"
 #include "gh.h"
 #include "io.h"
 #include "katoshe.h"
@@ -64,70 +65,8 @@ static cli_options take_options(int argc, char **argv, const char **rest, int *r
     return opt;
 }
 
-static const char *env_or_null(const char *name) {
-    const char *v = getenv(name);
-    return (v && v[0]) ? v : NULL;
-}
-
-static void copy_str(char *dst, size_t cap, const char *src) {    size_t n = 0;
-    if (!src) { if (cap) dst[0] = '\0'; return; }
-    while (n + 1 < cap && src[n]) n++;
-    memcpy(dst, src, n);
-    dst[n] = '\0';
-}
-
-/* --token, then KATOSHE_GITHUB_TOKEN, then config/secrets.json. */
-static void resolve_token(const cli_options *opt, const char *config_dir,
-                          char *out, size_t cap) {
-    char err[256];
-    const char *env = env_or_null("KATOSHE_GITHUB_TOKEN");
-
-    out[0] = '\0';
-    if (opt->token && opt->token[0]) {
-        copy_str(out, cap, opt->token);
-        return;
-    }
-    if (env) {
-        copy_str(out, cap, env);
-        return;
-    }
-    if (katoshe_token_from_file(config_dir, out, cap, err, sizeof err) != 0) out[0] = '\0';
-}
-
-/* Per-repository setting, then KATOSHE_PROXY, then the global setting. */
-static const char *resolve_proxy(const katoshe_config *cfg, const char *owner,
-                                 const char *repo) {
-    const char *env = env_or_null("KATOSHE_PROXY");
-
-    if (cfg) {
-        for (int i = 0; i < cfg->repo_count; i++) {
-            const katoshe_repo *r = &cfg->repos[i];
-            char ro[128], rr[128];
-            if (r->proxy[0] && gh_parse_url(r->url, ro, sizeof ro, rr, sizeof rr) == 0 &&
-                strcmp(ro, owner) == 0 && strcmp(rr, repo) == 0) {
-                return r->proxy;
-            }
-        }
-    }
-    if (env) return env;
-    if (cfg && cfg->global.proxy[0]) return cfg->global.proxy;
-    return NULL;
-}
-
-static int is_absolute_path(const char *path) {
-    if (!path[0]) return 0;
-    if (path[0] == '\\' || path[0] == '/') return 1;
-    return path[1] == ':';
-}
-
-/* The configured download directory, anchored to the base directory unless the
-   user gave an absolute path. */
-static int resolve_download_dir(const char *base, const char *configured, char *out, size_t cap) {
-    if (is_absolute_path(configured)) {
-        return snprintf(out, cap, "%s", configured) < (int)cap ? 0 : -1;
-    }
-    return katoshe_path_join(out, cap, base, configured);
-}
+/* Token, proxy and download-directory resolution live in core/env.c: the GUI
+   needs the same answers, and a copy per front end is how they drift apart. */
 
 static int filter_ok(const katoshe_repo *r, const char *const *args, int arg_count) {
     char owner[128], repo[128], key[300];
@@ -222,9 +161,9 @@ static int cmd_list(const cli_options *opt, const char *target) {
         katoshe_config_defaults(&cfg);
     }
 
-    resolve_token(opt, paths.config_dir, token, sizeof token);
+    katoshe_resolve_token(opt->token, paths.config_dir, token, sizeof token);
     memset(&gh_opt, 0, sizeof gh_opt);
-    gh_opt.proxy = resolve_proxy(have_config ? &cfg : NULL, owner, repo);
+    gh_opt.proxy = katoshe_resolve_proxy(have_config ? &cfg : NULL, owner, repo);
     gh_opt.token = token[0] ? token : NULL;
     gh_opt.timeout_sec = have_config ? cfg.global.timeout_sec : 60;
 
@@ -283,12 +222,12 @@ static int run_begin(const cli_options *opt, run_context *ctx, char *err, size_t
         return -1;
     }
     if (katoshe_state_load(&ctx->state, ctx->lockfile_path, err, errlen) != 0) return -1;
-    if (resolve_download_dir(ctx->paths.base, ctx->cfg.global.download_dir, ctx->download_dir,
+    if (katoshe_download_dir(ctx->paths.base, ctx->cfg.global.download_dir, ctx->download_dir,
                              sizeof ctx->download_dir) != 0) {
         snprintf(err, errlen, "download directory path too long");
         return -1;
     }
-    resolve_token(opt, ctx->paths.config_dir, ctx->token, sizeof ctx->token);
+    katoshe_resolve_token(opt->token, ctx->paths.config_dir, ctx->token, sizeof ctx->token);
     return 0;
 }
 
@@ -345,7 +284,7 @@ static int cmd_check(const cli_options *opt, const char *const *args, int arg_co
         state_repo = katoshe_state_repo_get(&ctx.state, key, 0);
 
         memset(&gh_opt, 0, sizeof gh_opt);
-        gh_opt.proxy = resolve_proxy(&ctx.cfg, owner, repo_name);
+        gh_opt.proxy = katoshe_resolve_proxy(&ctx.cfg, owner, repo_name);
         gh_opt.token = ctx.token[0] ? ctx.token : NULL;
         gh_opt.timeout_sec = ctx.cfg.global.timeout_sec;
         gh_opt.etag = (state_repo && state_repo->etag[0]) ? state_repo->etag : NULL;
@@ -404,7 +343,7 @@ static void digest_hex(const char *digest, char *out, size_t cap) {
     out[0] = '\0';
     if (_strnicmp(p, "sha256:", 7) == 0) p += 7;
     if (strlen(p) != 64) return;
-    copy_str(out, cap, p);
+    katoshe_copy_str(out, cap, p);
 }
 
 typedef struct {
@@ -482,7 +421,7 @@ static int cmd_update(const cli_options *opt, const char *const *args, int arg_c
         }
 
         memset(&gh_opt, 0, sizeof gh_opt);
-        gh_opt.proxy = resolve_proxy(&ctx.cfg, owner, repo_name);
+        gh_opt.proxy = katoshe_resolve_proxy(&ctx.cfg, owner, repo_name);
         gh_opt.token = ctx.token[0] ? ctx.token : NULL;
         gh_opt.timeout_sec = ctx.cfg.global.timeout_sec;
         /* No ETag here: update needs the asset list even when the release did
@@ -537,7 +476,7 @@ static int cmd_update(const cli_options *opt, const char *const *args, int arg_c
             }
 
             memset(&dl, 0, sizeof dl);
-            dl.proxy = resolve_proxy(&ctx.cfg, owner, repo_name);
+            dl.proxy = katoshe_resolve_proxy(&ctx.cfg, owner, repo_name);
             dl.token = ctx.token[0] ? ctx.token : NULL;
             dl.timeout_sec = ctx.cfg.global.timeout_sec;
             dl.retries = ctx.cfg.global.retries;
@@ -577,18 +516,18 @@ static int cmd_update(const cli_options *opt, const char *const *args, int arg_c
                 if (sa) {
                     sa->asset_id = item->asset_id;
                     sa->size = res.bytes;
-                    copy_str(sa->remote_name, sizeof sa->remote_name, item->remote_name);
-                    copy_str(sa->path, sizeof sa->path, item->path);
-                    copy_str(sa->digest, sizeof sa->digest, item->digest);
-                    copy_str(sa->sha256, sizeof sa->sha256, res.sha256);
+                    katoshe_copy_str(sa->remote_name, sizeof sa->remote_name, item->remote_name);
+                    katoshe_copy_str(sa->path, sizeof sa->path, item->path);
+                    katoshe_copy_str(sa->digest, sizeof sa->digest, item->digest);
+                    katoshe_copy_str(sa->sha256, sizeof sa->sha256, res.sha256);
                     touched = 1;
                 }
             }
         }
 
         state_repo->release_id = release.id;
-        copy_str(state_repo->tag, sizeof state_repo->tag, release.tag);
-        copy_str(state_repo->etag, sizeof state_repo->etag, meta.etag);
+        katoshe_copy_str(state_repo->tag, sizeof state_repo->tag, release.tag);
+        katoshe_copy_str(state_repo->etag, sizeof state_repo->etag, meta.etag);
         now_iso(state_repo->checked_at, sizeof state_repo->checked_at);
         touched = 1;
 
@@ -632,7 +571,7 @@ static int cmd_preset(const cli_options *opt, const char *const *args, int arg_c
         katoshe_path_join(settings_path, sizeof settings_path, paths.config_dir, "settings.json");
         if (katoshe_config_load(&cfg, settings_path, paths.presets_dir, NULL, err, sizeof err) ==
             0) {
-            copy_str(active, sizeof active, cfg.preset);
+            katoshe_copy_str(active, sizeof active, cfg.preset);
             katoshe_config_free(&cfg);
         }
         if (katoshe_preset_list(paths.presets_dir, &list, &count, err, sizeof err) != 0) {
@@ -677,7 +616,7 @@ static int cmd_preset(const cli_options *opt, const char *const *args, int arg_c
                 return 1;
             }
             katoshe_config_defaults(&cfg);
-            copy_str(cfg.preset, sizeof cfg.preset, args[1]);
+            katoshe_copy_str(cfg.preset, sizeof cfg.preset, args[1]);
             if (katoshe_preset_write(&cfg, preset_path, err, sizeof err) != 0) {
                 fprintf(stderr, "error: %s\n", err);
                 return 1;
@@ -697,7 +636,7 @@ static int cmd_preset(const cli_options *opt, const char *const *args, int arg_c
             fprintf(stderr, "error: %s\n", err);
             return 1;
         }
-        copy_str(cfg.preset, sizeof cfg.preset, args[1]);
+        katoshe_copy_str(cfg.preset, sizeof cfg.preset, args[1]);
         if (katoshe_config_save(&cfg, settings_path, paths.presets_dir, err, sizeof err) != 0) {
             fprintf(stderr, "error: %s\n", err);
             katoshe_config_free(&cfg);
@@ -835,8 +774,8 @@ static int cmd_add(const cli_options *opt, const char *url) {
     }
     ctx.cfg.repos = repos;
     memset(&repos[ctx.cfg.repo_count], 0, sizeof *repos);
-    copy_str(repos[ctx.cfg.repo_count].name, sizeof repos[0].name, repo_name);
-    copy_str(repos[ctx.cfg.repo_count].url, sizeof repos[0].url, url);
+    katoshe_copy_str(repos[ctx.cfg.repo_count].name, sizeof repos[0].name, repo_name);
+    katoshe_copy_str(repos[ctx.cfg.repo_count].url, sizeof repos[0].url, url);
     repos[ctx.cfg.repo_count].include_prerelease = -1;
     ctx.cfg.repo_count++;
 

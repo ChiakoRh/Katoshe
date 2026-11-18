@@ -24,6 +24,7 @@ add_library(katoshe_core STATIC
     src/core/config.c
     src/core/io.c
     src/core/match.c
+    src/core/env.c
     src/core/state.c
     src/core/plan.c
     src/core/preset.c
