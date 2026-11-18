@@ -1,0 +1,18 @@
+# build output
+build/
+dist/
+
+# local state (never commit: lockfile, token, personal config)
+data/
+downloads/
+config/secrets.json
+config/repositories.json
+
+# local working docs, not published
+IMPLEMENTATION_PLAN.md
+Katoshe-Tool-Specifications.md
+
+# editor / tooling
+.vs/
+*.user
+*.suo
