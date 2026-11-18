@@ -15,50 +15,68 @@ static void usage(void) {
     printf("  update  [repo...]   download and update selected assets\n");
     printf("  list    <owner/repo> show the target release and its assets\n");
     printf("  validate            parse and validate the configuration\n");
-    printf("  add     <url>       add a repository to the configuration\n\n");
+    printf("  add     <url>       add a repository to the active preset\n\n");
     printf("  --root <dir>        use <dir> instead of the exe folder or %%APPDATA%%\n");
+    printf("  --preset <name>     use this preset for this run only\n");
     printf("  --version           print the version and exit\n");
     printf("  --help              print this text and exit\n");
 }
 
-static const char *take_root(int argc, char **argv, const char **rest, int *rest_count) {
-    const char *root = NULL;
+typedef struct {
+    const char *root;
+    const char *preset;
+} cli_options;
+
+static cli_options take_options(int argc, char **argv, const char **rest, int *rest_count) {
+    cli_options opt = {NULL, NULL};
     *rest_count = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--root") == 0 && i + 1 < argc) {
-            root = argv[++i];
+            opt.root = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--preset") == 0 && i + 1 < argc) {
+            opt.preset = argv[++i];
             continue;
         }
         rest[(*rest_count)++] = argv[i];
     }
-    return root;
+    return opt;
 }
 
-static int cmd_validate(const char *root) {
+static int cmd_validate(const cli_options *opt) {
     katoshe_paths paths;
     katoshe_config cfg;
     char err[512];
-    char path[600];
+    char settings_path[600];
     char summary[512];
+    int rc;
 
-    if (katoshe_paths_init(&paths, root, err, sizeof err) != 0) {
+    if (katoshe_paths_init(&paths, opt->root, err, sizeof err) != 0) {
         fprintf(stderr, "error: %s\n", err);
         return 2;
     }
-    if (katoshe_path_join(path, sizeof path, paths.config_dir, "repositories.json") != 0) {
+    if (katoshe_path_join(settings_path, sizeof settings_path, paths.config_dir, "settings.json") != 0) {
         fprintf(stderr, "error: config path too long\n");
         return 2;
     }
-    if (katoshe_config_load(&cfg, path, err, sizeof err) != 0) {
+    rc = katoshe_config_load(&cfg, settings_path, paths.presets_dir, opt->preset, err, sizeof err);
+    if (rc != 0) {
         fprintf(stderr, "error: %s\n", err);
-        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
-            fprintf(stderr, "hint: copy config\\repositories.example.json to %s\n", path);
+        if (GetFileAttributesA(settings_path) == INVALID_FILE_ATTRIBUTES) {
+            fprintf(stderr, "hint: copy config\\settings.example.json to %s\n", settings_path);
+            fprintf(stderr, "      and config\\presets\\default.example.json to %s\\default.json\n",
+                    paths.presets_dir);
+        } else if (strstr(err, "cannot read") != NULL) {
+            fprintf(stderr, "hint: a missing preset starts empty; copy "
+                            "config\\presets\\default.example.json into %s\n",
+                    paths.presets_dir);
         }
         return 2;
     }
 
     katoshe_config_summary(&cfg, summary, sizeof summary);
-    printf("ok   %s\n", path);
+    printf("ok   %s\n", settings_path);
     printf("     base %s (%s)\n", paths.base, paths.portable ? "portable" : "appdata");
     printf("     %s\n", summary);
     katoshe_config_free(&cfg);
@@ -68,7 +86,7 @@ static int cmd_validate(const char *root) {
 int main(int argc, char **argv) {
     const char *args[16];
     int arg_count = 0;
-    const char *root = take_root(argc, argv, args, &arg_count);
+    cli_options opt = take_options(argc, argv, args, &arg_count);
 
     if (arg_count < 1) {
         usage();
@@ -83,7 +101,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (strcmp(args[0], "validate") == 0) {
-        return cmd_validate(root);
+        return cmd_validate(&opt);
     }
     if (strcmp(args[0], "selftest") == 0) {
         int failed = katoshe_selftest();

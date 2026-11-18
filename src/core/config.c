@@ -12,6 +12,7 @@
 
 void katoshe_config_defaults(katoshe_config *cfg) {
     memset(cfg, 0, sizeof *cfg);
+    snprintf(cfg->preset, sizeof cfg->preset, "default");
     snprintf(cfg->global.download_dir, sizeof cfg->global.download_dir, "downloads");
     snprintf(cfg->global.proxy, sizeof cfg->global.proxy, "socks5h://127.0.0.1:10808");
     cfg->global.include_prerelease = false;
@@ -24,6 +25,38 @@ void katoshe_config_defaults(katoshe_config *cfg) {
 
 static void err_at(char *err, size_t errlen, const char *where, const char *what) {
     snprintf(err, errlen, "%s: %s", where, what);
+}
+
+/* Prefixes a field error with the file it came from. */
+static int wrap(char *err, size_t errlen, const char *label) {
+    char tmp[512];
+    snprintf(tmp, sizeof tmp, "%s: %s", label, err);
+    snprintf(err, errlen, "%s", tmp);
+    return -1;
+}
+
+bool katoshe_preset_name_ok(const char *name) {
+    size_t n;
+    if (!name || !name[0]) return false;
+    n = strlen(name);
+    if (n >= KATOSHE_PRESET_MAX) return false;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = name[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/* A preset is untrusted input, so relative paths only: no drive, no root slash,
+   no .. anywhere. */
+static bool dir_is_safe(const char *dir) {
+    if (!dir[0]) return true;
+    if (dir[0] == '/' || dir[0] == '\\') return false;
+    if (dir[1] == ':') return false;
+    return strstr(dir, "..") == NULL;
 }
 
 static char *read_file(const char *path, size_t *len_out) {
@@ -69,7 +102,7 @@ static int parse_assets(katoshe_repo *repo, const cJSON *arr, const char *where,
     for (int i = 0; i < n; i++) {
         const cJSON *item = cJSON_GetArrayItem(arr, i);
         katoshe_asset *a = &repo->assets[repo->asset_count];
-        char at[160];
+        char at[192];
         snprintf(at, sizeof at, "%s.assets[%d]", where, i);
 
         if (!cJSON_IsObject(item)) { err_at(err, errlen, at, "expected an object"); return -1; }
@@ -91,6 +124,10 @@ static int parse_assets(katoshe_repo *repo, const cJSON *arr, const char *where,
         if (!a->match[0]) { err_at(err, errlen, at, "match is required"); return -1; }
         if (strpbrk(a->match, "\\/")) {
             err_at(err, errlen, at, "match must not contain a path separator");
+            return -1;
+        }
+        if (!dir_is_safe(a->dir)) {
+            err_at(err, errlen, at, "dir must be a relative path without \"..\"");
             return -1;
         }
         if (a->mode == KATOSHE_MODE_ARCHIVE && (a->keep_versions < 1 || a->keep_versions > 99)) {
@@ -129,6 +166,11 @@ static int parse_repos(katoshe_config *cfg, const cJSON *arr, char *err, size_t 
         get_str(item, "dir", r->dir, sizeof r->dir);
         get_str(item, "proxy", r->proxy, sizeof r->proxy);
         get_int(item, "include_prerelease", &r->include_prerelease);
+        {
+            /* Accept true/false as well as 1/0; absent means "inherit". */
+            const cJSON *pr = cJSON_GetObjectItemCaseSensitive(item, "include_prerelease");
+            if (cJSON_IsBool(pr)) r->include_prerelease = cJSON_IsTrue(pr) ? 1 : 0;
+        }
 
         if (!r->url[0]) {
             err_at(err, errlen, where, "url is required");
@@ -136,6 +178,10 @@ static int parse_repos(katoshe_config *cfg, const cJSON *arr, char *err, size_t 
         }
         if (strstr(r->url, "github.com") == NULL) {
             err_at(err, errlen, where, "url must point at github.com");
+            return -1;
+        }
+        if (!dir_is_safe(r->dir)) {
+            err_at(err, errlen, where, "dir must be a relative path without \"..\"");
             return -1;
         }
         if (!r->name[0]) {
@@ -162,16 +208,26 @@ static int parse_repos(katoshe_config *cfg, const cJSON *arr, char *err, size_t 
     return 0;
 }
 
-int katoshe_config_load(katoshe_config *cfg, const char *path, char *err, size_t errlen) {
-    katoshe_config_defaults(cfg);
+static int check_version(const cJSON *doc, const char *label, char *err, size_t errlen) {
+    const cJSON *version = cJSON_GetObjectItemCaseSensitive(doc, "version");
+    if (!cJSON_IsNumber(version) || (int)version->valuedouble != KATOSHE_CONFIG_VERSION) {
+        snprintf(err, errlen, "%s: version must be %d", label, KATOSHE_CONFIG_VERSION);
+        return -1;
+    }
+    return 0;
+}
 
+static int load_settings(katoshe_config *cfg, const char *path, char *err, size_t errlen) {
     char *text = read_file(path, NULL);
+    cJSON *doc;
+    const cJSON *glob;
+    const cJSON *preset;
+
     if (!text) {
         snprintf(err, errlen, "cannot read %s", path);
         return -1;
     }
-
-    cJSON *doc = cJSON_Parse(text);
+    doc = cJSON_Parse(text);
     free(text);
     if (!doc) {
         snprintf(err, errlen, "%s is not valid JSON", path);
@@ -182,18 +238,31 @@ int katoshe_config_load(katoshe_config *cfg, const char *path, char *err, size_t
         snprintf(err, errlen, "the top level of %s must be an object", path);
         return -1;
     }
-
-    const cJSON *version = cJSON_GetObjectItemCaseSensitive(doc, "version");
-    if (!cJSON_IsNumber(version) || (int)version->valuedouble != KATOSHE_CONFIG_VERSION) {
+    if (check_version(doc, "settings.json", err, errlen) != 0) {
         cJSON_Delete(doc);
-        snprintf(err, errlen, "version must be %d", KATOSHE_CONFIG_VERSION);
         return -1;
     }
 
-    const cJSON *glob = cJSON_GetObjectItemCaseSensitive(doc, "global");
+    preset = cJSON_GetObjectItemCaseSensitive(doc, "preset");
+    if (preset && !cJSON_IsString(preset)) {
+        cJSON_Delete(doc);
+        err_at(err, errlen, "settings.json: preset", "must be a string");
+        return -1;
+    }
+    if (cJSON_IsString(preset) && preset->valuestring && preset->valuestring[0]) {
+        if (!katoshe_preset_name_ok(preset->valuestring)) {
+            cJSON_Delete(doc);
+            err_at(err, errlen, "settings.json: preset",
+                   "may only contain letters, digits, dot, dash and underscore");
+            return -1;
+        }
+        snprintf(cfg->preset, sizeof cfg->preset, "%s", preset->valuestring);
+    }
+
+    glob = cJSON_GetObjectItemCaseSensitive(doc, "global");
     if (glob && !cJSON_IsObject(glob)) {
         cJSON_Delete(doc);
-        err_at(err, errlen, "global", "must be an object");
+        err_at(err, errlen, "settings.json: global", "must be an object");
         return -1;
     }
     if (glob) {
@@ -206,40 +275,104 @@ int katoshe_config_load(katoshe_config *cfg, const char *path, char *err, size_t
         get_int(glob, "retries", &cfg->global.retries);
         get_str(glob, "log_level", cfg->global.log_level, sizeof cfg->global.log_level);
     }
+
     if (cfg->global.jobs < 1 || cfg->global.jobs > 16) {
         cJSON_Delete(doc);
-        err_at(err, errlen, "global.jobs", "must be 1..16");
+        err_at(err, errlen, "settings.json: global.jobs", "must be 1..16");
         return -1;
     }
     if (cfg->global.retries < 0 || cfg->global.retries > 10) {
         cJSON_Delete(doc);
-        err_at(err, errlen, "global.retries", "must be 0..10");
+        err_at(err, errlen, "settings.json: global.retries", "must be 0..10");
         return -1;
     }
     if (cfg->global.timeout_sec < 1 || cfg->global.timeout_sec > 3600) {
         cJSON_Delete(doc);
-        err_at(err, errlen, "global.timeout_sec", "must be 1..3600");
+        err_at(err, errlen, "settings.json: global.timeout_sec", "must be 1..3600");
         return -1;
     }
     if (!cfg->global.download_dir[0]) {
         cJSON_Delete(doc);
-        err_at(err, errlen, "global.download_dir", "must not be empty");
+        err_at(err, errlen, "settings.json: global.download_dir", "must not be empty");
         return -1;
     }
 
-    const cJSON *repos = cJSON_GetObjectItemCaseSensitive(doc, "repositories");
+    cfg->settings_doc = doc;
+    return 0;
+}
+
+static int load_preset(katoshe_config *cfg, const char *path, char *err, size_t errlen) {
+    char label[96];
+    char *text;
+    cJSON *doc;
+    const cJSON *repos;
+
+    snprintf(label, sizeof label, "presets\\%s.json", cfg->preset);
+    text = read_file(path, NULL);
+    if (!text) {
+        snprintf(err, errlen, "cannot read %s", path);
+        return -1;
+    }
+    doc = cJSON_Parse(text);
+    free(text);
+    if (!doc) {
+        snprintf(err, errlen, "%s is not valid JSON", path);
+        return -1;
+    }
+    if (!cJSON_IsObject(doc)) {
+        cJSON_Delete(doc);
+        snprintf(err, errlen, "the top level of %s must be an object", path);
+        return -1;
+    }
+    if (check_version(doc, label, err, errlen) != 0) {
+        cJSON_Delete(doc);
+        return -1;
+    }
+
+    repos = cJSON_GetObjectItemCaseSensitive(doc, "repositories");
     if (repos && !cJSON_IsArray(repos)) {
         cJSON_Delete(doc);
-        err_at(err, errlen, "repositories", "must be an array");
+        err_at(err, errlen, "presets: repositories", "must be an array");
         return -1;
     }
     if (repos && parse_repos(cfg, repos, err, errlen) != 0) {
         cJSON_Delete(doc);
+        return wrap(err, errlen, label);
+    }
+
+    cfg->preset_doc = doc;
+    return 0;
+}
+
+int katoshe_config_load(katoshe_config *cfg, const char *settings_path,
+                        const char *presets_dir, const char *preset_override,
+                        char *err, size_t errlen) {
+    char preset_path[KATOSHE_PATH_MAX + 96];
+
+    katoshe_config_defaults(cfg);
+
+    if (load_settings(cfg, settings_path, err, errlen) != 0) return -1;
+
+    if (preset_override && preset_override[0]) {
+        if (!katoshe_preset_name_ok(preset_override)) {
+            err_at(err, errlen, "--preset",
+                   "may only contain letters, digits, dot, dash and underscore");
+            katoshe_config_free(cfg);
+            return -1;
+        }
+        snprintf(cfg->preset, sizeof cfg->preset, "%s", preset_override);
+    }
+
+    if (snprintf(preset_path, sizeof preset_path, "%s\\%s.json", presets_dir, cfg->preset) >=
+        (int)sizeof preset_path) {
+        err_at(err, errlen, presets_dir, "preset path too long");
         katoshe_config_free(cfg);
         return -1;
     }
-
-    cfg->doc = doc;
+    if (load_preset(cfg, preset_path, err, errlen) != 0) {
+        katoshe_config_free(cfg);
+        return -1;
+    }
     return 0;
 }
 
@@ -306,25 +439,22 @@ static cJSON *find_asset_source(const cJSON *repo, const char *match) {
     return NULL;
 }
 
-static int build_document(katoshe_config *cfg, cJSON **out, char *err, size_t errlen) {
+static cJSON *build_settings_document(katoshe_config *cfg) {
+    static const char *const top_keys[] = {"version", "preset", "global"};
     static const char *const global_keys[] = {"download_dir", "proxy", "include_prerelease",
                                               "check_on_launch", "jobs", "timeout_sec",
                                               "retries", "log_level"};
-    static const char *const repo_keys[] = {"name", "url", "dir", "include_prerelease",
-                                            "proxy", "assets"};
-    static const char *const asset_keys[] = {"match", "filename", "dir", "mode",
-                                             "keep_versions"};
-    static const char *const top_keys[] = {"version", "global", "repositories"};
-
-    const cJSON *old_global = cfg->doc ? cJSON_GetObjectItemCaseSensitive(cfg->doc, "global") : NULL;
-
+    const cJSON *old_global =
+        cfg->settings_doc ? cJSON_GetObjectItemCaseSensitive(cfg->settings_doc, "global") : NULL;
     cJSON *doc = cJSON_CreateObject();
-    if (!doc) { err_at(err, errlen, "config", "out of memory"); return -1; }
+    cJSON *g;
 
-    copy_unknown(cfg->doc, doc, top_keys, (int)(sizeof top_keys / sizeof *top_keys));
+    if (!doc) return NULL;
+    copy_unknown(cfg->settings_doc, doc, top_keys, (int)(sizeof top_keys / sizeof *top_keys));
     cJSON_AddNumberToObject(doc, "version", KATOSHE_CONFIG_VERSION);
+    set_str(doc, "preset", cfg->preset);
 
-    cJSON *g = cJSON_CreateObject();
+    g = cJSON_CreateObject();
     cJSON_AddItemToObject(doc, "global", g);
     copy_unknown(old_global, g, global_keys, (int)(sizeof global_keys / sizeof *global_keys));
     set_str(g, "download_dir", cfg->global.download_dir);
@@ -335,20 +465,35 @@ static int build_document(katoshe_config *cfg, cJSON **out, char *err, size_t er
     set_int(g, "timeout_sec", cfg->global.timeout_sec);
     set_int(g, "retries", cfg->global.retries);
     set_str(g, "log_level", cfg->global.log_level);
+    return doc;
+}
 
-    cJSON *repos = cJSON_CreateArray();
+static cJSON *build_preset_document(katoshe_config *cfg) {
+    static const char *const top_keys[] = {"version", "repositories"};
+    static const char *const repo_keys[] = {"name", "url", "dir", "include_prerelease",
+                                            "proxy", "assets"};
+    static const char *const asset_keys[] = {"match", "filename", "dir", "mode",
+                                             "keep_versions"};
+    cJSON *doc = cJSON_CreateObject();
+    cJSON *repos;
+
+    if (!doc) return NULL;
+    copy_unknown(cfg->preset_doc, doc, top_keys, (int)(sizeof top_keys / sizeof *top_keys));
+    cJSON_AddNumberToObject(doc, "version", KATOSHE_CONFIG_VERSION);
+
+    repos = cJSON_CreateArray();
     cJSON_AddItemToObject(doc, "repositories", repos);
 
     for (int i = 0; i < cfg->repo_count; i++) {
         const katoshe_repo *r = &cfg->repos[i];
-        cJSON *old_repo = find_repo_source(cfg->doc, r->name);
+        cJSON *old_repo = find_repo_source(cfg->preset_doc, r->name);
         cJSON *ro = cJSON_CreateObject();
 
         copy_unknown(old_repo, ro, repo_keys, (int)(sizeof repo_keys / sizeof *repo_keys));
         set_str(ro, "name", r->name);
         set_str(ro, "url", r->url);
         if (r->dir[0]) set_str(ro, "dir", r->dir);
-        if (r->include_prerelease >= 0) set_int(ro, "include_prerelease", r->include_prerelease);
+        if (r->include_prerelease >= 0) set_bool(ro, "include_prerelease", r->include_prerelease != 0);
         if (r->proxy[0]) set_str(ro, "proxy", r->proxy);
 
         cJSON *assets = cJSON_CreateArray();
@@ -370,13 +515,11 @@ static int build_document(katoshe_config *cfg, cJSON **out, char *err, size_t er
         }
         cJSON_AddItemToArray(repos, ro);
     }
-
-    *out = doc;
-    return 0;
+    return doc;
 }
 
 static int write_atomic(const char *path, const char *text, char *err, size_t errlen) {
-    char tmp[KATOSHE_PATH_MAX + 8];
+    char tmp[KATOSHE_PATH_MAX + 96];
     if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) {
         err_at(err, errlen, path, "path too long");
         return -1;
@@ -404,40 +547,79 @@ static int write_atomic(const char *path, const char *text, char *err, size_t er
     return 0;
 }
 
-int katoshe_config_save(katoshe_config *cfg, const char *path, char *err, size_t errlen) {
-    cJSON *doc = NULL;
-    if (build_document(cfg, &doc, err, errlen) != 0) return -1;
-
+static int write_document(cJSON *doc, const char *path, char *err, size_t errlen) {
     char *text = cJSON_PrintBuffered(doc, 4096, 1);
+    int rc;
     if (!text) {
-        cJSON_Delete(doc);
         err_at(err, errlen, path, "out of memory while printing");
         return -1;
     }
-
-    int rc = write_atomic(path, text, err, errlen);
+    rc = write_atomic(path, text, err, errlen);
     cJSON_free(text);
-    if (rc == 0) {
-        if (cfg->doc) cJSON_Delete(cfg->doc);
-        cfg->doc = doc; /* keep the new document for the next save */
-    } else {
-        cJSON_Delete(doc);
-    }
     return rc;
+}
+
+int katoshe_config_save(katoshe_config *cfg, const char *settings_path,
+                        const char *presets_dir, char *err, size_t errlen) {
+    char preset_path[KATOSHE_PATH_MAX + 96];
+    cJSON *settings = build_settings_document(cfg);
+    cJSON *preset = NULL;
+
+    if (!settings) {
+        err_at(err, errlen, settings_path, "out of memory");
+        return -1;
+    }
+    if (!katoshe_preset_name_ok(cfg->preset)) {
+        cJSON_Delete(settings);
+        err_at(err, errlen, "preset", "invalid name");
+        return -1;
+    }
+    if (snprintf(preset_path, sizeof preset_path, "%s\\%s.json", presets_dir, cfg->preset) >=
+        (int)sizeof preset_path) {
+        cJSON_Delete(settings);
+        err_at(err, errlen, presets_dir, "preset path too long");
+        return -1;
+    }
+
+    preset = build_preset_document(cfg);
+    if (!preset) {
+        cJSON_Delete(settings);
+        err_at(err, errlen, preset_path, "out of memory");
+        return -1;
+    }
+
+    /* Preset first: settings points at it, so a half-written pair still resolves. */
+    if (write_document(preset, preset_path, err, errlen) != 0) {
+        cJSON_Delete(settings);
+        cJSON_Delete(preset);
+        return -1;
+    }
+    if (write_document(settings, settings_path, err, errlen) != 0) {
+        cJSON_Delete(settings);
+        cJSON_Delete(preset);
+        return -1;
+    }
+
+    if (cfg->settings_doc) cJSON_Delete(cfg->settings_doc);
+    if (cfg->preset_doc) cJSON_Delete(cfg->preset_doc);
+    cfg->settings_doc = settings;
+    cfg->preset_doc = preset;
+    return 0;
 }
 
 void katoshe_config_free(katoshe_config *cfg) {
     if (!cfg) return;
     for (int i = 0; i < cfg->repo_count; i++) free(cfg->repos[i].assets);
     free(cfg->repos);
-    if (cfg->doc) cJSON_Delete(cfg->doc);
+    if (cfg->settings_doc) cJSON_Delete(cfg->settings_doc);
+    if (cfg->preset_doc) cJSON_Delete(cfg->preset_doc);
     memset(cfg, 0, sizeof *cfg);
 }
 
 void katoshe_config_summary(const katoshe_config *cfg, char *out, size_t cap) {
     int assets = 0;
     for (int i = 0; i < cfg->repo_count; i++) assets += cfg->repos[i].asset_count;
-    snprintf(out, cap, "%d repositories, %d assets, jobs %d, proxy %s",
-             cfg->repo_count, assets, cfg->global.jobs,
+    snprintf(out, cap, "preset %s: %d repositories, %d assets, jobs %d, proxy %s",
+             cfg->preset, cfg->repo_count, assets, cfg->global.jobs,
              cfg->global.proxy[0] ? cfg->global.proxy : "(direct)");
 }

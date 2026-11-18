@@ -11,6 +11,7 @@ typedef struct {
     char base[512];
     char config_dir[512];
     char data_dir[512];
+    char presets_dir[512];
     bool portable;
 } katoshe_paths;
 

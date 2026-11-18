@@ -78,7 +78,8 @@ int katoshe_paths_init(katoshe_paths *p, const char *root_override, char *err, s
     }
 
     if (fmt(p->config_dir, sizeof p->config_dir, p->base, "config") != 0 ||
-        fmt(p->data_dir, sizeof p->data_dir, p->base, "data") != 0) {
+        fmt(p->data_dir, sizeof p->data_dir, p->base, "data") != 0 ||
+        fmt(p->presets_dir, sizeof p->presets_dir, p->config_dir, "presets") != 0) {
         snprintf(err, errlen, "path too long under %s", p->base);
         return -1;
     }
@@ -88,6 +89,10 @@ int katoshe_paths_init(katoshe_paths *p, const char *root_override, char *err, s
     }
     if (katoshe_mkdir(p->config_dir) != 0) {
         snprintf(err, errlen, "cannot create %s", p->config_dir);
+        return -1;
+    }
+    if (katoshe_mkdir(p->presets_dir) != 0) {
+        snprintf(err, errlen, "cannot create %s", p->presets_dir);
         return -1;
     }
     if (katoshe_mkdir(p->data_dir) != 0) {

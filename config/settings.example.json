@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "preset": "default",
+  "global": {
+    "download_dir": "downloads",
+    "proxy": "socks5h://127.0.0.1:10808",
+    "include_prerelease": false,
+    "check_on_launch": true,
+    "jobs": 2,
+    "timeout_sec": 60,
+    "retries": 3,
+    "log_level": "info"
+  }
+}
