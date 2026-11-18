@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "cjson/cJSON.h"
+#include "io.h"
 
 #define KATOSHE_CONFIG_VERSION 1
 
@@ -57,22 +58,6 @@ static bool dir_is_safe(const char *dir) {
     if (dir[0] == '/' || dir[0] == '\\') return false;
     if (dir[1] == ':') return false;
     return strstr(dir, "..") == NULL;
-}
-
-static char *read_file(const char *path, size_t *len_out) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    long n = ftell(f);
-    if (n < 0) { fclose(f); return NULL; }
-    rewind(f);
-    char *buf = (char *)malloc((size_t)n + 1);
-    if (!buf) { fclose(f); return NULL; }
-    size_t got = fread(buf, 1, (size_t)n, f);
-    fclose(f);
-    buf[got] = '\0';
-    if (len_out) *len_out = got;
-    return buf;
 }
 
 /* Every getter keeps the default when the key is missing or has the wrong type. */
@@ -218,7 +203,7 @@ static int check_version(const cJSON *doc, const char *label, char *err, size_t 
 }
 
 static int load_settings(katoshe_config *cfg, const char *path, char *err, size_t errlen) {
-    char *text = read_file(path, NULL);
+    char *text = katoshe_read_file(path);
     cJSON *doc;
     const cJSON *glob;
     const cJSON *preset;
@@ -308,7 +293,7 @@ static int load_preset(katoshe_config *cfg, const char *path, char *err, size_t 
     const cJSON *repos;
 
     snprintf(label, sizeof label, "presets\\%s.json", cfg->preset);
-    text = read_file(path, NULL);
+    text = katoshe_read_file(path);
     if (!text) {
         snprintf(err, errlen, "cannot read %s", path);
         return -1;
@@ -518,35 +503,6 @@ static cJSON *build_preset_document(katoshe_config *cfg) {
     return doc;
 }
 
-static int write_atomic(const char *path, const char *text, char *err, size_t errlen) {
-    char tmp[KATOSHE_PATH_MAX + 96];
-    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) {
-        err_at(err, errlen, path, "path too long");
-        return -1;
-    }
-    HANDLE h = CreateFileA(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        err_at(err, errlen, tmp, "cannot create the temporary file");
-        return -1;
-    }
-    DWORD len = (DWORD)strlen(text);
-    DWORD written = 0;
-    BOOL ok = WriteFile(h, text, len, &written, NULL);
-    CloseHandle(h);
-    if (!ok || written != len) {
-        DeleteFileA(tmp);
-        err_at(err, errlen, tmp, "cannot write the temporary file");
-        return -1;
-    }
-    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
-        DeleteFileA(tmp);
-        err_at(err, errlen, path, "cannot replace the file");
-        return -1;
-    }
-    return 0;
-}
-
 static int write_document(cJSON *doc, const char *path, char *err, size_t errlen) {
     char *text = cJSON_PrintBuffered(doc, 4096, 1);
     int rc;
@@ -554,7 +510,7 @@ static int write_document(cJSON *doc, const char *path, char *err, size_t errlen
         err_at(err, errlen, path, "out of memory while printing");
         return -1;
     }
-    rc = write_atomic(path, text, err, errlen);
+    rc = katoshe_write_atomic(path, text, err, errlen);
     cJSON_free(text);
     return rc;
 }

@@ -22,6 +22,14 @@ add_library(katoshe_core STATIC
     src/core/version.c
     src/core/paths.c
     src/core/config.c
+    src/core/io.c
+    src/core/match.c
+    src/core/state.c
+    src/core/plan.c
+    src/core/preset.c
+    src/core/archive.c
+    src/core/sha256.c
+    src/core/download.c
     src/core/selftest.c
     src/core/gh.c
     src/core/secrets.c
@@ -50,6 +58,7 @@ cui_app_target(katoshe)   # windowed, no console, links only the components used
 
 if (MSVC)
     foreach(t katoshe_core katoshe-cli katoshe)
+        target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(${t} PRIVATE /W4 /utf-8)
     endforeach()
 endif()

@@ -20,11 +20,6 @@ typedef struct {
     int overflow;
 } membuf;
 
-typedef struct {
-    long remaining;      /* -1 when the header is absent */
-    long long reset;     /* unix seconds, 0 when absent */
-} ratelimit;
-
 static void copy_str(char *dst, size_t cap, const char *src, size_t max) {
     size_t n = 0;
     if (!src) { if (cap) dst[0] = '\0'; return; }
@@ -163,14 +158,16 @@ static bool header_value(const char *line, size_t len, const char *name, char *o
 }
 
 static size_t on_header(char *buffer, size_t size, size_t nitems, void *userdata) {
-    ratelimit *rl = (ratelimit *)userdata;
+    gh_meta *meta = (gh_meta *)userdata;
     size_t len = size * nitems;
-    char value[64];
+    char value[160];
 
     if (header_value(buffer, len, "x-ratelimit-remaining", value, sizeof value)) {
-        rl->remaining = strtol(value, NULL, 10);
+        meta->remaining = strtol(value, NULL, 10);
     } else if (header_value(buffer, len, "x-ratelimit-reset", value, sizeof value)) {
-        rl->reset = strtoll(value, NULL, 10);
+        meta->reset = strtoll(value, NULL, 10);
+    } else if (header_value(buffer, len, "etag", value, sizeof value)) {
+        copy_str(meta->etag, sizeof meta->etag, value, sizeof meta->etag - 1);
     }
     return len;
 }
@@ -186,7 +183,7 @@ static void format_reset(long long reset, char *out, size_t cap) {
 }
 
 static int http_get(const char *url, const gh_options *opt, membuf *body, long *status,
-                    ratelimit *rl, char *err, size_t errlen) {
+                    gh_meta *meta, char *err, size_t errlen) {
     CURL *curl = curl_easy_init();
     CURLcode rc;
     char agent[64];
@@ -200,8 +197,8 @@ static int http_get(const char *url, const gh_options *opt, membuf *body, long *
     }
 
     memset(body, 0, sizeof *body);
-    rl->remaining = -1;
-    rl->reset = 0;
+    memset(meta, 0, sizeof *meta);
+    meta->remaining = -1;
     *status = 0;
     curl_err[0] = '\0';
 
@@ -224,7 +221,7 @@ static int http_get(const char *url, const gh_options *opt, membuf *body, long *
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_write);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, body);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, on_header);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, rl);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, meta);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_err);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)(opt->timeout_sec > 0 ? opt->timeout_sec : 60));
@@ -274,7 +271,7 @@ static const char *json_string(const cJSON *obj, const char *key) {
 }
 
 /* Turns a non-200 into something that says what to do next. */
-static int explain_status(long status, const membuf *body, const ratelimit *rl,
+static int explain_status(long status, const membuf *body, const gh_meta *meta,
                           const char *what, char *err, size_t errlen) {
     char reset[64];
     char api_message[256];
@@ -295,8 +292,8 @@ static int explain_status(long status, const membuf *body, const ratelimit *rl,
     } else if (status == 401) {
         snprintf(err, errlen, "GitHub rejected the token (401): %s",
                  api_message[0] ? api_message : "bad credentials");
-    } else if ((status == 403 || status == 429) && rl->remaining == 0) {
-        format_reset(rl->reset, reset, sizeof reset);
+    } else if ((status == 403 || status == 429) && meta->remaining == 0) {
+        format_reset(meta->reset, reset, sizeof reset);
         snprintf(err, errlen, "GitHub API rate limit exhausted, resets at %s%s%s", reset,
                  api_message[0] ? " - " : "", api_message);
     } else if (status == 403) {
@@ -317,6 +314,10 @@ static int parse_release(const cJSON *rel, gh_release *out, gh_asset **assets,
     int n;
 
     if (cJSON_IsTrue(draft)) return GH_NOT_MODIFIED; /* skip, caller keeps looking */
+    {
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(rel, "id");
+        out->id = cJSON_IsNumber(id) ? (long long)id->valuedouble : 0;
+    }
     copy_str(out->tag, sizeof out->tag, json_string(rel, "tag_name"), sizeof out->tag - 1);
     copy_str(out->name, sizeof out->name, json_string(rel, "name"), sizeof out->name - 1);
     copy_str(out->published_at, sizeof out->published_at, json_string(rel, "published_at"),
@@ -335,6 +336,8 @@ static int parse_release(const cJSON *rel, gh_release *out, gh_asset **assets,
         const cJSON *item = cJSON_GetArrayItem(assets_json, i);
         gh_asset *a = &(*assets)[i];
         const cJSON *size = cJSON_GetObjectItemCaseSensitive(item, "size");
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(item, "id");
+        a->id = cJSON_IsNumber(id) ? (long long)id->valuedouble : 0;
         copy_str(a->name, sizeof a->name, json_string(item, "name"), sizeof a->name - 1);
         copy_str(a->url, sizeof a->url, json_string(item, "browser_download_url"),
                  sizeof a->url - 1);
@@ -346,19 +349,20 @@ static int parse_release(const cJSON *rel, gh_release *out, gh_asset **assets,
 }
 
 int gh_fetch_release(const char *owner, const char *repo, bool include_prerelease,
-                     const gh_options *opt, gh_release *release, gh_asset **assets,
-                     int *asset_count, char *err, size_t errlen) {
+                     const gh_options *opt, gh_meta *meta, gh_release *release,
+                     gh_asset **assets, int *asset_count, char *err, size_t errlen) {
     static int curl_ready;
     char url[512];
     char what[300];
     membuf body;
-    ratelimit rl;
     long status = 0;
     int rc;
     cJSON *doc;
     const cJSON *rel;
 
     memset(release, 0, sizeof *release);
+    memset(meta, 0, sizeof *meta);
+    meta->remaining = -1;
     *assets = NULL;
     *asset_count = 0;
     err[0] = '\0';
@@ -378,7 +382,7 @@ int gh_fetch_release(const char *owner, const char *repo, bool include_prereleas
         snprintf(url, sizeof url, GH_API "/repos/%s/%s/releases/latest", owner, repo);
     }
 
-    rc = http_get(url, opt, &body, &status, &rl, err, errlen);
+    rc = http_get(url, opt, &body, &status, meta, err, errlen);
     if (rc != GH_OK) return rc;
 
     if (status == 304) {
@@ -386,7 +390,7 @@ int gh_fetch_release(const char *owner, const char *repo, bool include_prereleas
         return GH_NOT_MODIFIED;
     }
     if (status != 200) {
-        rc = explain_status(status, &body, &rl, what, err, errlen);
+        rc = explain_status(status, &body, meta, what, err, errlen);
         free(body.data);
         return rc;
     }

@@ -7,8 +7,16 @@
 #include <string.h>
 
 #include "config.h"
+#include "download.h"
 #include "gh.h"
+#include "io.h"
+#include "match.h"
 #include "paths.h"
+#include "plan.h"
+#include "preset.h"
+#include "sha256.h"
+#include "archive.h"
+#include "state.h"
 
 static int failures;
 
@@ -17,6 +25,13 @@ static void check(int cond, const char *name) {
         printf("FAIL %s\n", name);
         failures++;
     }
+}
+
+static void copy_str_into(char *dst, size_t cap, const char *src) {
+    size_t n = 0;
+    while (n + 1 < cap && src[n]) n++;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
 }
 
 static void put(const char *path, const char *text) {
@@ -287,6 +302,188 @@ int katoshe_selftest(void) {
               strstr(err, "ghost.json") != NULL,
           "missing preset names the path");
     katoshe_config_free(&cfg);
+
+    /* 10. wildcard matcher: the table from the design, including the traps */
+    {
+        static const struct {
+            const char *pattern;
+            const char *name;
+            int hit;
+        } cases[] = {
+            {"*.apk", "app-v8.apk", 1},
+            {"*.apk", "app-v8.apk.idsig", 0},
+            {"app-*.zip", "app-win64.zip", 1},
+            {"app-*.zip", "APP-win64.zip", 0},      /* case sensitive */
+            {"app?.txt", "app1.txt", 1},
+            {"app?.txt", "app12.txt", 0},
+            {"[ab]x", "ax", 1},
+            {"[ab]x", "cx", 0},
+            {"[!ab]x", "cx", 1},
+            {"[a-c]x", "bx", 1},
+            {"*", "anything", 1},
+            {"*", "", 1},
+            {"a*b*c", "aXXbYYc", 1},
+            {"a*b*c", "aXXbYY", 0},
+            {"", "", 1},
+            {"", "x", 0},
+            {"[unterminated", "u", 0},
+        };
+        for (int i = 0; i < (int)(sizeof cases / sizeof *cases); i++) {
+            int got = katoshe_match(cases[i].pattern, cases[i].name) ? 1 : 0;
+            if (got != cases[i].hit) printf("     (match case %d: %s / %s)\n", i, cases[i].pattern,
+                                            cases[i].name);
+            check(got == cases[i].hit, "wildcard matches the table");
+        }
+    }
+
+    /* 11. lockfile round trip */
+    {
+        katoshe_state st, back;
+        char path[MAX_PATH];
+        katoshe_state_repo *r;
+        katoshe_state_asset *as;
+
+        memset(&st, 0, sizeof st);
+        r = katoshe_state_repo_get(&st, "owner/X", 1);
+        check(r != NULL, "state repo created");
+        if (r) {
+            r->release_id = 777;
+            copy_str_into(r->tag, sizeof r->tag, "v1.4.2");
+            copy_str_into(r->etag, sizeof r->etag, "W/\"abc\"");
+            as = katoshe_state_asset_get(r, "*.apk", 1);
+            check(as != NULL, "state asset created");
+            if (as) {
+                as->asset_id = 999;
+                as->size = 123456;
+                copy_str_into(as->remote_name, sizeof as->remote_name, "X-1.4.2-v8.apk");
+                copy_str_into(as->path, sizeof as->path, "downloads/X/X-app.apk");
+                copy_str_into(as->digest, sizeof as->digest, "sha256:9f2c");
+                copy_str_into(as->sha256, sizeof as->sha256, "9f2c");
+            }
+        }
+        snprintf(path, sizeof path, "%s\\lockfile.json", a.root);
+        check(katoshe_state_save(&st, path, err, sizeof err) == 0, "lockfile saved");
+        katoshe_state_free(&st);
+
+        check(katoshe_state_load(&back, path, err, sizeof err) == 0, "lockfile loaded");
+        check(back.repo_count == 1, "lockfile keeps the repository");
+        if (back.repo_count == 1) {
+            r = &back.repos[0];
+            check(strcmp(r->key, "owner/X") == 0, "lockfile keeps the key");
+            check(r->release_id == 777, "lockfile keeps the release id");
+            check(strcmp(r->etag, "W/\"abc\"") == 0, "lockfile keeps the etag");
+            check(r->asset_count == 1, "lockfile keeps the asset");
+            if (r->asset_count == 1) {
+                as = &r->assets[0];
+                check(strcmp(as->match, "*.apk") == 0, "lockfile keys on match, not the remote name");
+                check(as->asset_id == 999 && as->size == 123456, "lockfile keeps id and size");
+                check(strcmp(as->remote_name, "X-1.4.2-v8.apk") == 0, "lockfile keeps the remote name");
+            }
+        }
+        katoshe_state_free(&back);
+
+        /* a corrupt lockfile is an error, not a silent reset */
+        put(path, "{ not json");
+        check(katoshe_state_load(&back, path, err, sizeof err) != 0 &&
+                  strstr(err, "delete it") != NULL,
+              "corrupt lockfile reported");
+        katoshe_state_free(&back);
+    }
+
+    /* 12. the decision table, against real files */
+    {
+        katoshe_repo repo;
+        katoshe_state state;
+        katoshe_state_repo *state_repo;
+        katoshe_state_asset *state_asset;
+        gh_release release;
+        gh_asset remote[2];
+        char download_dir[MAX_PATH];
+        char local[MAX_PATH];
+        plan p;
+
+        snprintf(download_dir, sizeof download_dir, "%s\\dl", a.root);
+        check(katoshe_mkdir_all(download_dir) == 0, "download dir created");
+
+        memset(&repo, 0, sizeof repo);
+        copy_str_into(repo.name, sizeof repo.name, "X");
+        repo.assets = (katoshe_asset *)calloc(3, sizeof *repo.assets);
+        repo.asset_count = 3;
+        copy_str_into(repo.assets[0].match, sizeof repo.assets[0].match, "X-app.apk");
+        copy_str_into(repo.assets[1].match, sizeof repo.assets[1].match, "*.zip");
+        copy_str_into(repo.assets[2].match, sizeof repo.assets[2].match, "absent.zip");
+
+        memset(&release, 0, sizeof release);
+        release.id = 10;
+        copy_str_into(release.tag, sizeof release.tag, "v1");
+
+        memset(remote, 0, sizeof remote);
+        remote[0].id = 100;
+        remote[0].size = 5;
+        copy_str_into(remote[0].name, sizeof remote[0].name, "X-app.apk");
+        copy_str_into(remote[0].digest, sizeof remote[0].digest, "sha256:aa");
+        remote[1].id = 101;
+        remote[1].size = 7;
+        copy_str_into(remote[1].name, sizeof remote[1].name, "X-win.zip");
+
+        memset(&state, 0, sizeof state);
+        state_repo = katoshe_state_repo_get(&state, "owner/X", 1);
+        state_repo->release_id = 10;
+        state_asset = katoshe_state_asset_get(state_repo, "X-app.apk", 1);
+        state_asset->asset_id = 100;
+        state_asset->size = 5;
+        copy_str_into(state_asset->digest, sizeof state_asset->digest, "sha256:aa");
+
+        snprintf(local, sizeof local, "%s\\X\\X-app.apk", download_dir);
+        {
+            char dir[MAX_PATH];
+            katoshe_dirname(local, dir, sizeof dir);
+            check(katoshe_mkdir_all(dir) == 0, "repo dir created");
+        }
+        put(local, "12345");
+
+        check(katoshe_plan_build(&repo, download_dir, &release, remote, 2, state_repo, &p, err,
+                                 sizeof err) == 0,
+              "plan built");
+        check(p.count == 3, "one plan item per selection");
+        if (p.count == 3) {
+            check(p.items[0].action == PLAN_UNCHANGED, "same release is unchanged");
+            check(p.items[1].action == PLAN_DOWNLOAD, "absent file is a download");
+            check(strcmp(p.items[1].remote_name, "X-win.zip") == 0, "wildcard picked the zip");
+            check(p.items[2].action == PLAN_MISSING, "unmatched selection is missing");
+        }
+        katoshe_plan_free(&p);
+
+        /* a size that disagrees with the lockfile means a damaged file */
+        put(local, "123");
+        check(katoshe_plan_build(&repo, download_dir, &release, remote, 2, state_repo, &p, err,
+                                 sizeof err) == 0,
+              "plan rebuilt");
+        if (p.count == 3) check(p.items[0].action == PLAN_DOWNLOAD, "size mismatch downloads");
+        katoshe_plan_free(&p);
+
+        /* a digest change in a new release means the file must be fetched again */
+        release.id = 11;
+        copy_str_into(remote[0].digest, sizeof remote[0].digest, "sha256:bb");
+        put(local, "12345");
+        check(katoshe_plan_build(&repo, download_dir, &release, remote, 2, NULL, &p, err,
+                                 sizeof err) == 0,
+              "plan rebuilt without state");
+        if (p.count == 3) check(p.items[0].action == PLAN_DOWNLOAD, "no record downloads");
+        katoshe_plan_free(&p);
+
+        free(repo.assets);
+        katoshe_state_free(&state);
+    }
+
+    printf("\n-- archive --\n");
+    failures += katoshe_archive_selftest();
+    printf("\n-- download --\n");
+    failures += katoshe_download_selftest();
+    printf("\n-- sha256 --\n");
+    failures += katoshe_sha256_selftest();
+    printf("\n-- presets --\n");
+    failures += katoshe_preset_selftest();
 
     sandbox_drop(&a);
     sandbox_drop(&b);
