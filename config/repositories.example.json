@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "global": {
+    "download_dir": "downloads",
+    "proxy": "socks5h://127.0.0.1:10808",
+    "include_prerelease": false,
+    "check_on_launch": true,
+    "jobs": 2,
+    "timeout_sec": 60,
+    "retries": 3,
+    "log_level": "info"
+  },
+  "repositories": [
+    {
+      "name": "X",
+      "url": "https://github.com/owner/X",
+      "dir": "X",
+      "include_prerelease": true,
+      "proxy": null,
+      "assets": [
+        { "match": "X-app-v8.apk" },
+        { "match": "X-win-64.exe", "filename": "X-win64.exe" },
+        { "match": "*-v8.apk", "mode": "archive", "keep_versions": 3, "dir": "android" }
+      ]
+    },
+    {
+      "name": "Y",
+      "url": "https://github.com/owner/Y",
+      "assets": [
+        { "match": "Y-app.apk" },
+        { "match": "Y-win-x64.zip", "dir": "windows" }
+      ]
+    }
+  ]
+}

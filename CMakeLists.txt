@@ -20,9 +20,14 @@ set(KATOSHE_CURL "${CMAKE_CURRENT_SOURCE_DIR}/third_party/curl")
 
 add_library(katoshe_core STATIC
     src/core/version.c
+    src/core/paths.c
+    src/core/config.c
+    src/core/selftest.c
+    vendor/cjson/cJSON.c
 )
 target_include_directories(katoshe_core PUBLIC
     src/core
+    vendor
     "${KATOSHE_CURL}/include"
 )
 target_compile_definitions(katoshe_core
