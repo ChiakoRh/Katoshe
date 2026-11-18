@@ -32,6 +32,9 @@ config/settings.example.json      -> config/settings.json
 config/presets/default.example.json -> config/presets/default.json
 ```
 
+The release zip already contains both filled-in files, so an extracted copy runs
+without that step.
+
 `settings.json` holds per-machine settings and the name of the active preset.
 `presets/<name>.json` holds repositories and their asset selections, and nothing
 else — that is the file you share.

@@ -31,6 +31,7 @@
 #include "match.h"
 #include "paths.h"
 #include "plan.h"
+#include "preset.h"
 #include "state.h"
 
 #define JOB_NONE 0
@@ -106,8 +107,16 @@ typedef struct {
     int sel_repo;
     int theme;         /* 0 system, 1 light, 2 dark */
     int theme_applied;
+    int platform_mask; /* asset quick pick, bit per platform_rules entry */
     int no_jump; /* --page was given: do not move the user off it */
     char err[512];
+
+    katoshe_preset_info *presets; /* config/presets/*.json, reloaded with the config */
+    int preset_count;
+    int preset_choice;
+    char preset_source[512]; /* import: a path, a URL or a katoshe:// link */
+    char preset_msg[192];
+    char pending_preset[KATOSHE_PRESET_MAX];
 
     char new_url[512];
     char new_name[128];
@@ -135,6 +144,23 @@ typedef struct {
 } job_view;
 
 static job_view view;
+
+/* Quick pick for the asset list. A keyword hit is a guess, not a real
+   fingerprint: it only decides what floats to the top. */
+typedef struct {
+    const char *chip;
+    const char *badge;
+    const char *keys[6];
+} platform_rule;
+
+static const platform_rule platform_rules[] = {
+    {"Android arm64-v8a", "arm64-v8a", {"arm64-v8a", "aarch64", NULL}},
+    {"Android armeabi-v7a", "armeabi-v7a", {"armeabi-v7a", "armv7", NULL}},
+    {"Windows", "windows", {"windows", "win64", "win32", "win-x64", ".exe", NULL}},
+    {"Linux", "linux", {"linux", ".appimage", ".deb", NULL}},
+    {"macOS", "macos", {"macos", "darwin", ".dmg", NULL}},
+};
+#define PLATFORM_COUNT ((int)(sizeof platform_rules / sizeof platform_rules[0]))
 
 static void job_log(gui_job *j, const char *fmt, ...) {
     va_list ap;
@@ -519,6 +545,13 @@ static void job_run_check_update(gui_state *s) {
             {
                 katoshe_state_asset *sa = katoshe_state_asset_get(state_repo, item->match, 1);
                 if (sa) {
+                    if (repo->assets[k].mode != KATOSHE_MODE_ARCHIVE) {
+                        char removed[KATOSHE_NAME_MAX];
+                        if (katoshe_replaced_old_file(sa->path, item->path, removed,
+                                                      sizeof removed)) {
+                            job_log(j, "    replaced %s", removed);
+                        }
+                    }
                     sa->asset_id = item->asset_id;
                     sa->size = res.bytes;
                     katoshe_copy_str(sa->remote_name, sizeof sa->remote_name, item->remote_name);
@@ -730,9 +763,37 @@ static void gui_load(gui_state *s) {
         }
     }
     s->theme_applied = -1;
+    s->platform_mask = 0;
+    if (s->cfg.settings_doc) {
+        cJSON *pl = cJSON_GetObjectItemCaseSensitive(s->cfg.settings_doc, "gui_platforms");
+        if (cJSON_IsArray(pl)) {
+            cJSON *it = NULL;
+            cJSON_ArrayForEach(it, pl) {
+                if (!cJSON_IsString(it) || !it->valuestring) continue;
+                for (int p = 0; p < PLATFORM_COUNT; p++) {
+                    if (strcmp(platform_rules[p].chip, it->valuestring) == 0) {
+                        s->platform_mask |= 1 << p;
+                    }
+                }
+            }
+        }
+    }
     s->dirty = fresh ? 1 : 0;
     s->token_dirty = 0;
     if (s->sel_repo >= s->cfg.repo_count) s->sel_repo = 0;
+
+    katoshe_preset_list_free(s->presets);
+    s->presets = NULL;
+    s->preset_count = 0;
+    s->preset_choice = -1;
+    if (katoshe_preset_list(s->paths.presets_dir, &s->presets, &s->preset_count, err,
+                            sizeof err) != 0) {
+        s->presets = NULL;
+        s->preset_count = 0;
+    }
+    for (int i = 0; i < s->preset_count; i++) {
+        if (strcmp(s->presets[i].name, s->cfg.preset) == 0) s->preset_choice = i;
+    }
 }
 
 /* The theme lives in settings.json under an unknown top-level key, which
@@ -749,7 +810,72 @@ static void set_theme(gui_state *s, int theme) {
     s->dirty = 1;
 }
 
-static void add_repo(gui_state *s) {    char owner[128], repo_name[128], name[128];
+/* Same trick for the asset quick pick: an unknown top-level key the CLI keeps
+   but never reads. */
+static void set_platforms(gui_state *s, int mask) {
+    cJSON *doc = s->cfg.settings_doc;
+    cJSON *arr;
+
+    s->platform_mask = mask;
+    if (!doc) doc = s->cfg.settings_doc = cJSON_CreateObject();
+    if (!doc) return;
+    cJSON_DeleteItemFromObjectCaseSensitive(doc, "gui_platforms");
+    arr = cJSON_AddArrayToObject(doc, "gui_platforms");
+    for (int p = 0; arr && p < PLATFORM_COUNT; p++) {
+        if (mask & (1 << p)) {
+            cJSON_AddItemToArray(arr, cJSON_CreateString(platform_rules[p].chip));
+        }
+    }
+    s->dirty = 1;
+}
+
+/* Points settings.json at another preset without writing the preset files: the
+   imported or chosen file is the source of truth, never the in-memory copy. */
+static int point_at_preset(gui_state *s, const char *name, char *err, size_t errlen) {
+    char *text = katoshe_read_file(s->settings_path);
+    cJSON *doc = text ? cJSON_Parse(text) : NULL;
+    char *printed;
+    int rc;
+
+    free(text);
+    if (!doc) doc = cJSON_CreateObject();
+    if (!doc) {
+        katoshe_copy_str(err, errlen, "out of memory");
+        return -1;
+    }
+    cJSON_DeleteItemFromObjectCaseSensitive(doc, "preset");
+    cJSON_AddStringToObject(doc, "preset", name);
+    printed = cJSON_Print(doc);
+    cJSON_Delete(doc);
+    if (!printed) {
+        katoshe_copy_str(err, errlen, "out of memory");
+        return -1;
+    }
+    rc = katoshe_write_atomic(s->settings_path, printed, err, errlen);
+    free(printed);
+    return rc;
+}
+
+static void import_preset(gui_state *s) {
+    char name[KATOSHE_PRESET_MAX];
+    char err[512];
+
+    if (!s->preset_source[0]) {
+        katoshe_copy_str(s->preset_msg, sizeof s->preset_msg, "Enter a file, URL or link first.");
+        return;
+    }
+    if (katoshe_preset_import(s->preset_source, s->paths.presets_dir, name, sizeof name, err,
+                              sizeof err) != 0) {
+        snprintf(s->preset_msg, sizeof s->preset_msg, "%s", err);
+        return;
+    }
+    snprintf(s->preset_msg, sizeof s->preset_msg, "Imported %s; switching to it.", name);
+    s->preset_source[0] = '\0';
+    katoshe_copy_str(s->pending_preset, sizeof s->pending_preset, name);
+}
+
+static void add_repo(gui_state *s) {
+    char owner[128], repo_name[128], name[128];
     katoshe_repo *grown;
     katoshe_repo *r;
 
@@ -925,15 +1051,21 @@ static void page_repositories(cui_ctx *ui, gui_state *s, const job_view *v) {
                         remove = i;
                     }
                 }
-                cui_input(ui, "url", r->url, sizeof r->url, .label = "URL",
-                          .width = CUI_FILL, .disabled = running);
+                if (cui_input(ui, "url", r->url, sizeof r->url, .label = "URL",
+                              .width = CUI_FILL, .disabled = running)) {
+                    s->dirty = 1;
+                }
                 cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
-                    cui_input(ui, "dir", r->dir, sizeof r->dir, .label = "Subdirectory",
-                              .placeholder = "default", .width = CUI_PX(220),
-                              .disabled = running);
-                    cui_input(ui, "proxy", r->proxy, sizeof r->proxy, .label = "Proxy override",
-                              .placeholder = "inherit", .width = CUI_GROW(1),
-                              .disabled = running);
+                    if (cui_input(ui, "dir", r->dir, sizeof r->dir, .label = "Subdirectory",
+                                  .placeholder = "default", .width = CUI_PX(220),
+                                  .disabled = running)) {
+                        s->dirty = 1;
+                    }
+                    if (cui_input(ui, "proxy", r->proxy, sizeof r->proxy,
+                                  .label = "Proxy override", .placeholder = "inherit",
+                                  .width = CUI_GROW(1), .disabled = running)) {
+                        s->dirty = 1;
+                    }
                     cui_select(ui, "prerelease", prerelease_names, 3, &prerelease,
                                .label = "Releases", .width = CUI_PX(160), .disabled = running);
                 }
@@ -960,6 +1092,62 @@ static int matched(katoshe_repo *r, const char *name) {
         if (strcmp(r->assets[i].match, name) == 0) return 1;
     }
     return 0;
+}
+
+/* True when a wildcard selection already takes this asset. */
+static int covered(katoshe_repo *r, const char *name) {
+    for (int i = 0; i < r->asset_count; i++) {
+        if (katoshe_match(r->assets[i].match, name)) return 1;
+    }
+    return 0;
+}
+
+static int has_ci(const char *hay, const char *needle) {
+    size_t n = strlen(needle);
+
+    if (n == 0) return 0;
+    for (; *hay; hay++) {
+        if (_strnicmp(hay, needle, n) == 0) return 1;
+    }
+    return 0;
+}
+
+static int platform_of(const char *name) {
+    for (int p = 0; p < PLATFORM_COUNT; p++) {
+        for (int k = 0; platform_rules[p].keys[k]; k++) {
+            if (has_ci(name, platform_rules[p].keys[k])) return p;
+        }
+    }
+    return -1;
+}
+
+static int platform_hit(const gui_state *s, const char *name) {
+    int p = platform_of(name);
+
+    return p >= 0 && (s->platform_mask & (1 << p)) != 0;
+}
+
+/* Assets the quick pick would add: platform hit, not already selected by name
+   and not already taken by a wildcard. */
+static int platform_candidates(gui_state *s, katoshe_repo *r, const job_view *v) {
+    int n = 0;
+
+    for (int i = 0; i < v->fetch_count; i++) {
+        const char *name = v->fetch[i].name;
+        if (!platform_hit(s, name)) continue;
+        if (matched(r, name) || covered(r, name)) continue;
+        n++;
+    }
+    return n;
+}
+
+static void select_platform_assets(gui_state *s, katoshe_repo *r, const job_view *v) {
+    for (int i = 0; i < v->fetch_count; i++) {
+        const char *name = v->fetch[i].name;
+        if (!platform_hit(s, name)) continue;
+        if (matched(r, name) || covered(r, name)) continue;
+        toggle_selection(s, r, name, 1);
+    }
 }
 
 static void page_assets(cui_ctx *ui, gui_state *s, const job_view *v) {
@@ -995,21 +1183,55 @@ static void page_assets(cui_ctx *ui, gui_state *s, const job_view *v) {
     r = &s->cfg.repos[sel];
 
     if (v->fetch_valid && v->fetch_repo == sel) {
+        int order[REMOTE_MAX];
+        int order_count = 0;
+        int candidates = platform_candidates(s, r, v);
+
         cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
             cui_label(ui, v->fetch_tag);
             cui_badge(ui, "target release", .tone = CUI_TONE_SUCCESS);
             cui_muted(ui, "Tick an asset to download it on every update.");
         }
+
+        cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+            cui_muted(ui, "Platforms");
+            for (int p = 0; p < PLATFORM_COUNT; p++) {
+                bool on = (s->platform_mask & (1 << p)) != 0;
+                if (cui_chip(ui, platform_rules[p].chip, &on)) {
+                    set_platforms(s, s->platform_mask ^ (1 << p));
+                }
+            }
+            cui_spacer(ui);
+            if (s->platform_mask && candidates > 0) {
+                char action[64];
+                snprintf(action, sizeof action, "Select %d matching", candidates);
+                if (cui_button(ui, action, .icon = CUI_ICON_CHECK, .disabled = running)) {
+                    select_platform_assets(s, r, v);
+                }
+            }
+        }
+
+        /* Chosen platforms float to the top; the rest keep their order. */
+        for (int pass = 0; pass < 2; pass++) {
+            for (int i = 0; i < v->fetch_count; i++) {
+                int hit = platform_hit(s, v->fetch[i].name) != 0;
+                if (hit == (pass == 0)) order[order_count++] = i;
+            }
+        }
+
         cui_scroll(ui, .id = "remote", .width = CUI_FILL,
                    .height = CUI_PX(v->fetch_count * 34.0f + 16.0f > 320.0f
                                         ? 320.0f
                                         : v->fetch_count * 34.0f + 16.0f),
                    .gap = 2) {
-            for (int i = 0; i < v->fetch_count; i++) {
+            for (int n = 0; n < order_count; n++) {
+                int i = order[n];
                 char label[400];
                 char size_text[32];
                 bool on = matched(r, v->fetch[i].name) != 0;
                 const char *pattern = NULL;
+                int platform = platform_hit(s, v->fetch[i].name) ? platform_of(v->fetch[i].name)
+                                                                 : -1;
 
                 if (!on) {
                     for (int k = 0; k < r->asset_count; k++) {
@@ -1029,6 +1251,9 @@ static void page_assets(cui_ctx *ui, gui_state *s, const job_view *v) {
                         cui_textf(ui, "matched by %s", pattern);
                     } else if (cui_checkbox(ui, label, &on)) {
                         toggle_selection(s, r, v->fetch[i].name, on);
+                    }
+                    if (platform >= 0) {
+                        cui_badge(ui, platform_rules[platform].badge, .tone = CUI_TONE_INFO);
                     }
                 }
                 cui_pop_id(ui);
@@ -1090,19 +1315,28 @@ static void page_assets(cui_ctx *ui, gui_state *s, const job_view *v) {
                     }
                 }
                 cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
-                    cui_input(ui, "match", a->match, sizeof a->match, .label = "Match",
-                              .width = CUI_GROW(1), .disabled = running);
-                    cui_input(ui, "filename", a->filename, sizeof a->filename,
-                              .label = "File name", .placeholder = "remote name",
-                              .width = CUI_PX(240), .hint = "replace mode only",
-                              .disabled = running);
+                    if (cui_input(ui, "match", a->match, sizeof a->match, .label = "Match",
+                                  .width = CUI_GROW(1), .disabled = running)) {
+                        s->dirty = 1;
+                    }
+                    if (cui_input(ui, "filename", a->filename, sizeof a->filename,
+                                  .label = "File name", .placeholder = "remote name",
+                                  .width = CUI_PX(240), .hint = "replace mode only",
+                                  .disabled = running)) {
+                        s->dirty = 1;
+                    }
                 }
                 cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
-                    cui_input(ui, "dir", a->dir, sizeof a->dir, .label = "Subdirectory",
-                              .placeholder = "repository directory", .width = CUI_GROW(1),
-                              .disabled = running);
-                    cui_select(ui, "mode", mode_names, 2, &mode, .label = "Mode",
-                               .width = CUI_PX(140), .disabled = running);
+                    if (cui_input(ui, "dir", a->dir, sizeof a->dir, .label = "Subdirectory",
+                                  .placeholder = "repository directory", .width = CUI_GROW(1),
+                                  .disabled = running)) {
+                        s->dirty = 1;
+                    }
+                    if (cui_select(ui, "mode", mode_names, 2, &mode, .label = "Mode",
+                                   .width = CUI_PX(140), .disabled = running)) {
+                        a->mode = mode == 1 ? KATOSHE_MODE_ARCHIVE : KATOSHE_MODE_REPLACE;
+                        s->dirty = 1;
+                    }
                     if (mode == 1) {
                         if (cui_number(ui, "keep", &keep, 1, 99, .label = "Versions to keep",
                                        .width = CUI_PX(150), .disabled = running)) {
@@ -1229,6 +1463,57 @@ static void page_settings(cui_ctx *ui, gui_state *s, const job_view *v) {
         }
 
         cui_card(ui, .width = CUI_FILL, .pad = 16, .gap = 10) {
+            const char *preset_names[64];
+            int preset_count = s->preset_count;
+            int choice = s->preset_choice;
+
+            cui_label(ui, "Presets");
+            cui_muted(ui, "A preset is the part you share: repositories and assets only. "
+                          "Switching one reloads the repository list.");
+            if (preset_count > 64) preset_count = 64;
+            for (int i = 0; i < preset_count; i++) preset_names[i] = s->presets[i].name;
+            cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
+                if (preset_count > 0) {
+                    if (cui_select(ui, "preset", preset_names, preset_count, &choice,
+                                   .label = "Active preset", .width = CUI_PX(260),
+                                   .disabled = running) &&
+                        choice >= 0 && choice < preset_count) {
+                        katoshe_copy_str(s->pending_preset, sizeof s->pending_preset,
+                                         s->presets[choice].name);
+                    }
+                } else {
+                    cui_muted(ui, "No preset files next to the settings yet.");
+                }
+                cui_input(ui, "preset-source", s->preset_source, sizeof s->preset_source,
+                          .label = "Import", .placeholder = "file, URL or katoshe:// link",
+                          .width = CUI_GROW(1), .disabled = running);
+                if (cui_icon_button(ui, CUI_ICON_FOLDER, .variant = CUI_BUTTON_GHOST,
+                                    .tooltip = "Pick a preset file",
+                                    .disabled = running)) {
+                    char picked[KATOSHE_PATH_MAX] = "";
+                    if (cui_app_file_dialog(s->app,
+                                            &(cui_file_dialog_opts){.kind = CUI_FILE_OPEN,
+                                                                    .title = "Open a preset",
+                                                                    .filter_name = "Preset",
+                                                                    .filter = "json"},
+                                            picked, sizeof picked) &&
+                        picked[0]) {
+                        katoshe_copy_str(s->preset_source, sizeof s->preset_source, picked);
+                        import_preset(s);
+                    }
+                }
+                if (cui_button(ui, "Import", .icon = CUI_ICON_PLUS, .disabled = running)) {
+                    import_preset(s);
+                }
+            }
+            if (s->pending_preset[0]) {
+                cui_muted(ui, "Switching preset…");
+            } else if (s->preset_msg[0]) {
+                cui_muted(ui, s->preset_msg);
+            }
+        }
+
+        cui_card(ui, .width = CUI_FILL, .pad = 16, .gap = 10) {
             cui_label(ui, "Appearance");
             int theme = s->theme;
             if (cui_select(ui, "theme", theme_names, 3, &theme, .label = "Theme",
@@ -1240,15 +1525,19 @@ static void page_settings(cui_ctx *ui, gui_state *s, const job_view *v) {
 
         cui_card(ui, .width = CUI_FILL, .pad = 16, .gap = 10) {
             cui_label(ui, "Network");
-            cui_input(ui, "proxy", s->cfg.global.proxy, sizeof s->cfg.global.proxy,
-                      .label = "Proxy", .placeholder = "socks5h://127.0.0.1:10808",
-                      .width = CUI_FILL, .disabled = running,
-                      .hint = "Per-repository overrides win over this one.");
-            cui_input(ui, "token", s->token_input, sizeof s->token_input, .label = "GitHub token",
-                      .password = true, .clearable = true, .width = CUI_FILL,
-                      .disabled = running,
-                      .hint = "Stored in config/secrets.json. No scopes are enough for public "
-                              "repositories.");
+            if (cui_input(ui, "proxy", s->cfg.global.proxy, sizeof s->cfg.global.proxy,
+                          .label = "Proxy", .placeholder = "socks5h://127.0.0.1:10808",
+                          .width = CUI_FILL, .disabled = running,
+                          .hint = "Per-repository overrides win over this one.")) {
+                s->dirty = 1;
+            }
+            if (cui_input(ui, "token", s->token_input, sizeof s->token_input,
+                          .label = "GitHub token", .password = true, .clearable = true,
+                          .width = CUI_FILL, .disabled = running,
+                          .hint = "Stored in config/secrets.json. No scopes are enough for "
+                                  "public repositories.")) {
+                s->token_dirty = 1;
+            }
             if (cui_number(ui, "jobs", &jobs, 1, 16, .label = "Parallel downloads",
                            .width = CUI_PX(200), .disabled = running,
                            .suffix = "files")) {
@@ -1260,16 +1549,11 @@ static void page_settings(cui_ctx *ui, gui_state *s, const job_view *v) {
                 s->dirty = 1;
             }
             if (cui_switch(ui, "Check on launch", &s->cfg.global.check_on_launch)) s->dirty = 1;
-            cui_input(ui, "log-level", s->cfg.global.log_level, sizeof s->cfg.global.log_level,
-                      .label = "Log level", .placeholder = "info", .width = CUI_PX(200),
-                      .disabled = running);
-        }
-
-        cui_card(ui, .width = CUI_FILL, .pad = 16, .gap = 6) {
-            cui_label(ui, "Presets");
-            cui_textf(ui, "Active preset: %s", s->cfg.preset);
-            cui_muted(ui, "Presets are files under config/presets. Create, import and export "
-                          "them with `katoshe-cli preset`.");
+            if (cui_input(ui, "log-level", s->cfg.global.log_level, sizeof s->cfg.global.log_level,
+                          .label = "Log level", .placeholder = "info", .width = CUI_PX(200),
+                          .disabled = running)) {
+                s->dirty = 1;
+            }
         }
     }
 }
@@ -1322,7 +1606,20 @@ static void frame(cui_ctx *ui, void *user) {
         }
     }
 
-    if (s->dirty || s->token_dirty) gui_save(s);
+    if (s->pending_preset[0]) {
+        char name[KATOSHE_PRESET_MAX];
+        char err[512];
+
+        katoshe_copy_str(name, sizeof name, s->pending_preset);
+        s->pending_preset[0] = '\0';
+        if (point_at_preset(s, name, err, sizeof err) == 0) {
+            gui_load(s);
+        } else {
+            katoshe_copy_str(s->err, sizeof s->err, err);
+        }
+    } else if (s->dirty || s->token_dirty) {
+        gui_save(s);
+    }
     if (view.running) cui_request_wakeup(ui, 0.1f);
     if (finished) cui_request_redraw(ui);
 }

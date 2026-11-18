@@ -104,6 +104,19 @@ oom:
     return -1;
 }
 
+int katoshe_replaced_old_file(const char *previous_path, const char *new_path,
+                              char *removed_name, size_t name_cap) {
+    if (removed_name && name_cap) removed_name[0] = '\0';
+    if (!previous_path || !previous_path[0] || !new_path || !new_path[0]) return 0;
+    if (_stricmp(previous_path, new_path) == 0) return 0;
+    if (!DeleteFileA(previous_path)) return 0; /* already gone counts as done */
+    if (removed_name && name_cap) {
+        const char *slash = strrchr(previous_path, '\\');
+        snprintf(removed_name, name_cap, "%s", slash ? slash + 1 : previous_path);
+    }
+    return 1;
+}
+
 /* ---- self-check ---- */
 
 static int failures;
@@ -190,6 +203,25 @@ int katoshe_archive_selftest(void) {
     DeleteFileA(path);
     snprintf(path, sizeof path, "%s\\app-1.4.0.zip.part", dir);
     DeleteFileA(path);
+
+    {
+        char old_path[MAX_PATH], new_path[MAX_PATH], removed[64];
+        snprintf(old_path, sizeof old_path, "%s\\old-name.zip", dir);
+        snprintf(new_path, sizeof new_path, "%s\\new-name.zip", dir);
+        put(old_path, "x", base);
+        put(new_path, "x", base);
+        check(katoshe_replaced_old_file(old_path, new_path, removed, sizeof removed) == 1,
+              "a renamed target removes the previous file");
+        check(strcmp(removed, "old-name.zip") == 0, "the removed file is reported");
+        check(GetFileAttributesA(old_path) == INVALID_FILE_ATTRIBUTES, "the old file is gone");
+        check(GetFileAttributesA(new_path) != INVALID_FILE_ATTRIBUTES, "the new file stays");
+        check(katoshe_replaced_old_file(new_path, new_path, removed, sizeof removed) == 0,
+              "the same path removes nothing");
+        check(katoshe_replaced_old_file("", new_path, removed, sizeof removed) == 0,
+              "no previous record removes nothing");
+        DeleteFileA(new_path);
+    }
+
     RemoveDirectoryA(dir);
     return failures;
 }

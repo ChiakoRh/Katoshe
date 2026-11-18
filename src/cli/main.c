@@ -384,6 +384,124 @@ static void now_iso(char *out, size_t cap) {
              t.wMinute, t.wSecond);
 }
 
+/* One repository's downloads, `jobs` at a time. Workers take the next item with
+   an atomic counter; printing, pruning and the lockfile update happen under one
+   lock, so lines never interleave and the state lists never race. The spinner is
+   only drawn when a single worker is running. */
+typedef struct {
+    const katoshe_repo *repo;
+    const plan *p;
+    const char *proxy;
+    const char *token;
+    int timeout_sec;
+    int retries;
+    int show_progress;
+    volatile LONG next;
+    CRITICAL_SECTION lock;
+    katoshe_state_repo *state_repo;
+    int downloaded;
+    int failed;
+    int touched;
+} dl_pool;
+
+static DWORD WINAPI dl_worker(void *param) {
+    dl_pool *pool = (dl_pool *)param;
+
+    for (;;) {
+        LONG idx = InterlockedIncrement(&pool->next) - 1;
+        const plan_item *item;
+        katoshe_download_opts dl;
+        katoshe_download_result res;
+        progress_ctx pc;
+        char expected[72];
+        char size_text[32];
+        char err[512];
+
+        if (idx < 0 || idx >= pool->p->count) return 0;
+        item = &pool->p->items[idx];
+        if (item->action != PLAN_DOWNLOAD) continue;
+
+        gh_format_size(item->size, size_text, sizeof size_text);
+        EnterCriticalSection(&pool->lock);
+        printf("  download  %-44s %10s\n", item->remote_name, size_text);
+        LeaveCriticalSection(&pool->lock);
+
+        if (mkdir_for(item->path) != 0) {
+            EnterCriticalSection(&pool->lock);
+            fprintf(stderr, "error: %s: cannot create the directory for %s\n", pool->repo->name,
+                    item->path);
+            pool->failed++;
+            LeaveCriticalSection(&pool->lock);
+            continue;
+        }
+
+        memset(&dl, 0, sizeof dl);
+        dl.proxy = pool->proxy;
+        dl.token = pool->token;
+        dl.timeout_sec = pool->timeout_sec;
+        dl.retries = pool->retries;
+        if (pool->show_progress) {
+            dl.progress = on_progress;
+            dl.user = &pc;
+            pc.name = item->remote_name;
+            pc.received = 0;
+        }
+        digest_hex(item->digest, expected, sizeof expected);
+
+        if (katoshe_download(item->url, item->path, expected[0] ? expected : NULL, &dl, &res,
+                             err, sizeof err) != 0) {
+            EnterCriticalSection(&pool->lock);
+            if (pool->show_progress) printf("\n");
+            fprintf(stderr, "error: %s: %s\n", pool->repo->name, err);
+            pool->failed++;
+            LeaveCriticalSection(&pool->lock);
+            continue;
+        }
+
+        EnterCriticalSection(&pool->lock);
+        if (pool->show_progress) printf("\r");
+        printf("    %-58s %s\n", item->remote_name, res.resumed ? "resumed" : "done");
+        pool->downloaded++;
+
+        /* Archive mode: index j is selection j, plan_build emits one item per
+           asset in configuration order. */
+        if (pool->repo->assets[idx].mode == KATOSHE_MODE_ARCHIVE) {
+            char dir[KATOSHE_PATH_MAX];
+            int pruned;
+            katoshe_dirname(item->path, dir, sizeof dir);
+            pruned = katoshe_archive_prune(dir, item->match, pool->repo->assets[idx].keep_versions,
+                                           err, sizeof err);
+            if (pruned < 0) {
+                fprintf(stderr, "warning: %s: %s\n", pool->repo->name, err);
+            } else if (pruned > 0) {
+                printf("    pruned %d older version%s\n", pruned, pruned == 1 ? "" : "s");
+            }
+        }
+
+        {
+            katoshe_state_asset *sa =
+                katoshe_state_asset_get(pool->state_repo, item->match, 1);
+            if (sa) {
+                if (pool->repo->assets[idx].mode != KATOSHE_MODE_ARCHIVE) {
+                    char removed[KATOSHE_NAME_MAX];
+                    if (katoshe_replaced_old_file(sa->path, item->path, removed,
+                                                  sizeof removed)) {
+                        printf("    replaced %s\n", removed);
+                    }
+                }
+                sa->asset_id = item->asset_id;
+                sa->size = res.bytes;
+                katoshe_copy_str(sa->remote_name, sizeof sa->remote_name, item->remote_name);
+                katoshe_copy_str(sa->path, sizeof sa->path, item->path);
+                katoshe_copy_str(sa->digest, sizeof sa->digest, item->digest);
+                katoshe_copy_str(sa->sha256, sizeof sa->sha256, res.sha256);
+                pool->touched = 1;
+            }
+        }
+        LeaveCriticalSection(&pool->lock);
+    }
+}
+
 static int cmd_update(const cli_options *opt, const char *const *args, int arg_count) {
     run_context ctx;
     char err[512];
@@ -448,81 +566,53 @@ static int cmd_update(const cli_options *opt, const char *const *args, int arg_c
         }
 
         for (int j = 0; j < p.count; j++) {
-            plan_item *item = &p.items[j];
-            katoshe_download_opts dl;
-            katoshe_download_result res;
-            char expected[72];
-            char size_text[32];
-            progress_ctx pc;
-
-            if (item->action == PLAN_UNCHANGED) {
+            if (p.items[j].action == PLAN_UNCHANGED) {
                 skipped++;
-                print_item(item);
-                continue;
-            }
-            if (item->action == PLAN_MISSING) {
+                print_item(&p.items[j]);
+            } else if (p.items[j].action == PLAN_MISSING) {
                 missing++;
-                print_item(item);
-                continue;
+                print_item(&p.items[j]);
             }
+        }
 
-            gh_format_size(item->size, size_text, sizeof size_text);
-            printf("  download  %-44s %10s\n", item->remote_name, size_text);
-            if (mkdir_for(item->path) != 0) {
-                fprintf(stderr, "error: %s: cannot create the directory for %s\n", repo->name,
-                        item->path);
-                failed++;
-                continue;
+        {
+            dl_pool pool;
+            HANDLE threads[16];
+            int workers = ctx.cfg.global.jobs;
+            int started = 0;
+
+            if (workers < 1) workers = 1;
+            if (workers > 16) workers = 16;
+            if (workers > p.count) workers = p.count;
+
+            memset(&pool, 0, sizeof pool);
+            pool.repo = repo;
+            pool.p = &p;
+            pool.proxy = katoshe_resolve_proxy(&ctx.cfg, owner, repo_name);
+            pool.token = ctx.token[0] ? ctx.token : NULL;
+            pool.timeout_sec = ctx.cfg.global.timeout_sec;
+            pool.retries = ctx.cfg.global.retries;
+            pool.show_progress = workers == 1;
+            pool.state_repo = state_repo;
+            InitializeCriticalSection(&pool.lock);
+
+            for (int t = 0; t < workers; t++) {
+                threads[t] = CreateThread(NULL, 0, dl_worker, &pool, 0, NULL);
+                if (threads[t]) started++;
             }
-
-            memset(&dl, 0, sizeof dl);
-            dl.proxy = katoshe_resolve_proxy(&ctx.cfg, owner, repo_name);
-            dl.token = ctx.token[0] ? ctx.token : NULL;
-            dl.timeout_sec = ctx.cfg.global.timeout_sec;
-            dl.retries = ctx.cfg.global.retries;
-            dl.progress = on_progress;
-            dl.user = &pc;
-            pc.name = item->remote_name;
-            pc.received = 0;
-            digest_hex(item->digest, expected, sizeof expected);
-
-            if (katoshe_download(item->url, item->path, expected[0] ? expected : NULL, &dl, &res,
-                                 err, sizeof err) != 0) {
-                printf("\n");
-                fprintf(stderr, "error: %s: %s\n", repo->name, err);
-                failed++;
-                continue;
+            if (started == 0) {
+                /* Still make progress when the thread cannot be created. */
+                dl_worker(&pool);
+                started = 0;
+            } else {
+                WaitForMultipleObjects((DWORD)started, threads, TRUE, INFINITE);
+                for (int t = 0; t < started; t++) CloseHandle(threads[t]);
             }
-            printf("\r    %-58s %s\n", item->remote_name, res.resumed ? "resumed" : "done");
-            downloaded++;
+            DeleteCriticalSection(&pool.lock);
 
-            /* Archive mode: old versions pile up, keep the newest N. Item j is
-               selection j — plan_build emits one item per asset, in order. */
-            if (repo->assets[j].mode == KATOSHE_MODE_ARCHIVE) {
-                char dir[KATOSHE_PATH_MAX];
-                int pruned;
-                katoshe_dirname(item->path, dir, sizeof dir);
-                pruned = katoshe_archive_prune(dir, item->match, repo->assets[j].keep_versions,
-                                               err, sizeof err);
-                if (pruned < 0) {
-                    fprintf(stderr, "warning: %s: %s\n", repo->name, err);
-                } else if (pruned > 0) {
-                    printf("    pruned %d older version%s\n", pruned, pruned == 1 ? "" : "s");
-                }
-            }
-
-            {
-                katoshe_state_asset *sa = katoshe_state_asset_get(state_repo, item->match, 1);
-                if (sa) {
-                    sa->asset_id = item->asset_id;
-                    sa->size = res.bytes;
-                    katoshe_copy_str(sa->remote_name, sizeof sa->remote_name, item->remote_name);
-                    katoshe_copy_str(sa->path, sizeof sa->path, item->path);
-                    katoshe_copy_str(sa->digest, sizeof sa->digest, item->digest);
-                    katoshe_copy_str(sa->sha256, sizeof sa->sha256, res.sha256);
-                    touched = 1;
-                }
-            }
+            downloaded += pool.downloaded;
+            failed += pool.failed;
+            if (pool.touched) touched = 1;
         }
 
         state_repo->release_id = release.id;

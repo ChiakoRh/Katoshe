@@ -15,7 +15,13 @@
 #define DL_PATH_MAX 1024
 #define DL_PROGRESS_MS 250
 
-static int curl_ready;
+static INIT_ONCE curl_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK curl_init_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once;
+    (void)param;
+    (void)ctx;
+    return curl_global_init(CURL_GLOBAL_DEFAULT) == 0;
+}
 
 typedef struct {
     FILE *f;
@@ -234,12 +240,9 @@ static int dl_attempt(const char *url, const char *part, const katoshe_download_
         }
     }
 
-    if (!curl_ready) {
-        if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
-            set_error(err, errlen, url, "cannot initialise libcurl");
-            goto done;
-        }
-        curl_ready = 1;
+    if (!InitOnceExecuteOnce(&curl_once, curl_init_once, NULL, NULL)) {
+        set_error(err, errlen, url, "cannot initialise libcurl");
+        goto done;
     }
     curl = curl_easy_init();
     if (!curl) {
