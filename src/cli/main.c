@@ -851,6 +851,9 @@ static int cmd_add(const cli_options *opt, const char *url) {
         }
     }
     printf("added %s/%s to preset '%s'\n", owner, repo_name, ctx.cfg.preset);
+    /* config_save writes the pointer along with the repositories, so a one-off
+       --preset here becomes the active one. Say so instead of doing it quietly. */
+    if (opt->preset && opt->preset[0]) printf("active preset is now '%s'\n", ctx.cfg.preset);
     run_end(&ctx);
     return 0;
 }
