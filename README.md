@@ -23,7 +23,9 @@ cmake --build build --config Release -j 2
 
 ## Configure
 
-Copy the examples once:
+The window creates `config/settings.json` and `config/presets/default.json` on its
+first run. For the console alone, or to start from a filled-in file, copy the
+examples once:
 
 ```text
 config/settings.example.json      -> config/settings.json

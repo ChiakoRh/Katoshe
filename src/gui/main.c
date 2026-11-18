@@ -707,12 +707,14 @@ static void gui_load(gui_state *s) {
         return;
     }
 
+    int fresh = GetFileAttributesA(s->settings_path) == INVALID_FILE_ATTRIBUTES;
     if (katoshe_config_load(&s->cfg, s->settings_path, s->paths.presets_dir,
                             s->preset_override[0] ? s->preset_override : NULL, err,
                             sizeof err) != 0) {
-        /* The window still opens: a fresh install has no preset yet, and the
-           user adds the first repository from the Repositories page. */
-        katoshe_copy_str(s->err, sizeof s->err, err);
+        /* A fresh install has no files at all: that is not an error, and the
+           empty configuration is written at the end of the first frame. A file
+           that exists but does not parse is left untouched. */
+        if (!fresh) katoshe_copy_str(s->err, sizeof s->err, err);
         katoshe_config_free(&s->cfg);
         katoshe_config_defaults(&s->cfg);
     }
@@ -728,7 +730,7 @@ static void gui_load(gui_state *s) {
         }
     }
     s->theme_applied = -1;
-    s->dirty = 0;
+    s->dirty = fresh ? 1 : 0;
     s->token_dirty = 0;
     if (s->sel_repo >= s->cfg.repo_count) s->sel_repo = 0;
 }
