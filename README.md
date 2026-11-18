@@ -74,8 +74,14 @@ katoshe-cli preset list|new|use|export|import
 katoshe-cli selftest           run the built-in checks
 ```
 
-Options: `--root <dir>` (config lives somewhere other than beside the exe or
-`%APPDATA%\Katoshe`), `--preset <name>` (one-off run), `--token <token>`.
+Options: `--root <dir>` (config lives somewhere other than beside the exe, the
+folder you start it from, or `%APPDATA%\Katoshe`), `--preset <name>` (one-off
+run), `--token <token>`.
+
+Katoshe looks for its `config` folder in this order: beside the exe, then in the
+current directory, then `%APPDATA%\Katoshe`. The last one is only used when
+neither of the first two has a `config` folder, so a checkout or a zip never
+starts on an empty preset by accident.
 
 `Update-All.bat` runs `update` from the folder it sits in, for a shortcut or a
 scheduled task.

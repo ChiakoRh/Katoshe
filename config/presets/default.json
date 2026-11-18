@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "repositories": [
+    {
+      "name": "SNI-Spoofing",
+      "url": "https://github.com/patterniha/SNI-Spoofing",
+      "dir": "sni-spoofing",
+      "assets": [
+        { "match": "*.rar" }
+      ]
+    },
+    {
+      "name": "WhiteDNS",
+      "url": "https://github.com/WhiteDNS/WhiteDNS-Android",
+      "dir": "whitedns",
+      "assets": [
+        { "match": "*-arm64-v8a.apk", "mode": "archive", "keep_versions": 2 }
+      ]
+    },
+    {
+      "name": "MITM-DomainFronting",
+      "url": "https://github.com/patterniha/MITM-DomainFronting",
+      "dir": "mitm-domainfronting",
+      "assets": [
+        { "match": "*" }
+      ]
+    }
+  ]
+}

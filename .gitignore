@@ -8,6 +8,8 @@ downloads/
 config/secrets.json
 config/settings.json
 config/presets/*.json
+# the shipped default preset is part of the repo: a fresh copy starts with it
+!config/presets/default.json
 !config/presets/*.example.json
 
 # local working docs, not published

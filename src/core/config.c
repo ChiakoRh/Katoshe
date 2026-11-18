@@ -336,6 +336,16 @@ int katoshe_config_load(katoshe_config *cfg, const char *settings_path,
 
     katoshe_config_defaults(cfg);
 
+    /* A fresh copy has no settings.json, only whatever shipped next to it.
+       config/presets/default.json is then the starting point, so a clone or an
+       unzip runs without copying files by hand. */
+    if (GetFileAttributesA(settings_path) == INVALID_FILE_ATTRIBUTES &&
+        snprintf(preset_path, sizeof preset_path, "%s\\default.json", presets_dir) <
+            (int)sizeof preset_path &&
+        GetFileAttributesA(preset_path) != INVALID_FILE_ATTRIBUTES) {
+        return load_preset(cfg, preset_path, err, errlen);
+    }
+
     if (load_settings(cfg, settings_path, err, errlen) != 0) return -1;
 
     if (preset_override && preset_override[0]) {

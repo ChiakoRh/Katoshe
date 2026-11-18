@@ -1182,180 +1182,180 @@ static void page_assets(cui_ctx *ui, gui_state *s, const job_view *v) {
     if (sel != s->sel_repo) s->sel_repo = sel;
     r = &s->cfg.repos[sel];
 
-    if (v->fetch_valid && v->fetch_repo == sel) {
-        int order[REMOTE_MAX];
-        int order_count = 0;
-        int candidates = platform_candidates(s, r, v);
+    cui_scroll(ui, .id = "assets-page", .width = CUI_FILL, .height = CUI_GROW(1),
+               .gap = 10, .pad = 2) {
+        if (v->fetch_valid && v->fetch_repo == sel) {
+            int order[REMOTE_MAX];
+            int order_count = 0;
+            int candidates = platform_candidates(s, r, v);
 
-        cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
-            cui_label(ui, v->fetch_tag);
-            cui_badge(ui, "target release", .tone = CUI_TONE_SUCCESS);
-            cui_muted(ui, "Tick an asset to download it on every update.");
-        }
-
-        cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
-            cui_muted(ui, "Platforms");
-            for (int p = 0; p < PLATFORM_COUNT; p++) {
-                bool on = (s->platform_mask & (1 << p)) != 0;
-                if (cui_chip(ui, platform_rules[p].chip, &on)) {
-                    set_platforms(s, s->platform_mask ^ (1 << p));
-                }
+            cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                cui_label(ui, v->fetch_tag);
+                cui_badge(ui, "target release", .tone = CUI_TONE_SUCCESS);
+                cui_muted(ui, "Tick an asset to download it on every update.");
             }
-            cui_spacer(ui);
-            if (s->platform_mask && candidates > 0) {
-                char action[64];
-                snprintf(action, sizeof action, "Select %d matching", candidates);
-                if (cui_button(ui, action, .icon = CUI_ICON_CHECK, .disabled = running)) {
-                    select_platform_assets(s, r, v);
-                }
-            }
-        }
 
-        /* Chosen platforms float to the top; the rest keep their order. */
-        for (int pass = 0; pass < 2; pass++) {
-            for (int i = 0; i < v->fetch_count; i++) {
-                int hit = platform_hit(s, v->fetch[i].name) != 0;
-                if (hit == (pass == 0)) order[order_count++] = i;
-            }
-        }
-
-        cui_scroll(ui, .id = "remote", .width = CUI_FILL,
-                   .height = CUI_PX(v->fetch_count * 34.0f + 16.0f > 320.0f
-                                        ? 320.0f
-                                        : v->fetch_count * 34.0f + 16.0f),
-                   .gap = 2) {
-            for (int n = 0; n < order_count; n++) {
-                int i = order[n];
-                char label[400];
-                char size_text[32];
-                bool on = matched(r, v->fetch[i].name) != 0;
-                const char *pattern = NULL;
-                int platform = platform_hit(s, v->fetch[i].name) ? platform_of(v->fetch[i].name)
-                                                                 : -1;
-
-                if (!on) {
-                    for (int k = 0; k < r->asset_count; k++) {
-                        if (katoshe_match(r->assets[k].match, v->fetch[i].name)) {
-                            pattern = r->assets[k].match;
-                            break;
-                        }
+            cui_row(ui, .width = CUI_FILL, .gap = 6, .align = CUI_ALIGN_CENTER) {
+                cui_muted(ui, "Platforms");
+                for (int p = 0; p < PLATFORM_COUNT; p++) {
+                    bool on = (s->platform_mask & (1 << p)) != 0;
+                    if (cui_chip(ui, platform_rules[p].chip, &on)) {
+                        set_platforms(s, s->platform_mask ^ (1 << p));
                     }
                 }
-                gh_format_size(v->fetch[i].size, size_text, sizeof size_text);
-                snprintf(label, sizeof label, "%s  (%s)", v->fetch[i].name, size_text);
+                cui_spacer(ui);
+                if (s->platform_mask && candidates > 0) {
+                    char action[64];
+                    snprintf(action, sizeof action, "Select %d matching", candidates);
+                    if (cui_button(ui, action, .icon = CUI_ICON_CHECK, .disabled = running)) {
+                        select_platform_assets(s, r, v);
+                    }
+                }
+            }
+
+            /* Chosen platforms float to the top; the rest keep their order. */
+            for (int pass = 0; pass < 2; pass++) {
+                for (int i = 0; i < v->fetch_count; i++) {
+                    int hit = platform_hit(s, v->fetch[i].name) != 0;
+                    if (hit == (pass == 0)) order[order_count++] = i;
+                }
+            }
+
+            /* Plain column: the whole page scrolls, so a long release cannot
+               eat the room the selections below need. */
+            cui_column(ui, .width = CUI_FILL, .gap = 2) {
+                for (int n = 0; n < order_count; n++) {
+                    int i = order[n];
+                    char label[400];
+                    char size_text[32];
+                    bool on = matched(r, v->fetch[i].name) != 0;
+                    const char *pattern = NULL;
+                    int platform = platform_hit(s, v->fetch[i].name) ? platform_of(v->fetch[i].name)
+                                                                     : -1;
+
+                    if (!on) {
+                        for (int k = 0; k < r->asset_count; k++) {
+                            if (katoshe_match(r->assets[k].match, v->fetch[i].name)) {
+                                pattern = r->assets[k].match;
+                                break;
+                            }
+                        }
+                    }
+                    gh_format_size(v->fetch[i].size, size_text, sizeof size_text);
+                    snprintf(label, sizeof label, "%s  (%s)", v->fetch[i].name, size_text);
+                    cui_push_id_int(ui, i);
+                    cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                        if (pattern) {
+                            cui_text(ui, CUI_ICON_CHECK, .color = CUI_COLOR_SUCCESS);
+                            cui_text(ui, label);
+                            cui_textf(ui, "matched by %s", pattern);
+                        } else if (cui_checkbox(ui, label, &on)) {
+                            toggle_selection(s, r, v->fetch[i].name, on);
+                        }
+                        if (platform >= 0) {
+                            cui_badge(ui, platform_rules[platform].badge, .tone = CUI_TONE_INFO);
+                        }
+                    }
+                    cui_pop_id(ui);
+                }
+            }
+        } else if (v->fetch_error[0] && v->fetch_repo == sel && !running) {
+            cui_text(ui, v->fetch_error, .color = CUI_COLOR_DANGER, .size = 13);
+        } else {
+            cui_muted(ui, "Fetch the release to see its assets as checkboxes, or add a "
+                          "wildcard selection below.");
+        }
+
+        cui_separator(ui);
+
+        cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
+            cui_input(ui, "new-match", s->new_match, sizeof s->new_match, .label = "Add a selection",
+                      .placeholder = "*.apk or an exact asset name", .width = CUI_GROW(1),
+                      .disabled = running);
+            if (cui_button(ui, "Add", .icon = CUI_ICON_PLUS, .disabled = running)) {
+                add_selection(s, r);
+            }
+        }
+
+        if (r->asset_count == 0) {
+            cui_muted(ui, "No selections for this repository.");
+            return;
+        }
+
+        cui_column(ui, .width = CUI_FILL, .gap = 8) {
+            for (int i = 0; i < r->asset_count; i++) {
+                katoshe_asset *a = &r->assets[i];
+                int mode = a->mode == KATOSHE_MODE_ARCHIVE ? 1 : 0;
+                double keep = a->keep_versions > 0 ? (double)a->keep_versions : 3;
+                char status_key[KEY_LEN];
+
+                snprintf(status_key, sizeof status_key, "%s/%s", r->name, a->match);
+
                 cui_push_id_int(ui, i);
-                cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
-                    if (pattern) {
-                        cui_text(ui, CUI_ICON_CHECK, .color = CUI_COLOR_SUCCESS);
-                        cui_text(ui, label);
-                        cui_textf(ui, "matched by %s", pattern);
-                    } else if (cui_checkbox(ui, label, &on)) {
-                        toggle_selection(s, r, v->fetch[i].name, on);
-                    }
-                    if (platform >= 0) {
-                        cui_badge(ui, platform_rules[platform].badge, .tone = CUI_TONE_INFO);
-                    }
-                }
-                cui_pop_id(ui);
-            }
-        }
-    } else if (v->fetch_error[0] && v->fetch_repo == sel && !running) {
-        cui_text(ui, v->fetch_error, .color = CUI_COLOR_DANGER, .size = 13);
-    } else {
-        cui_muted(ui, "Fetch the release to see its assets as checkboxes, or add a "
-                      "wildcard selection below.");
-    }
-
-    cui_separator(ui);
-
-    cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
-        cui_input(ui, "new-match", s->new_match, sizeof s->new_match, .label = "Add a selection",
-                  .placeholder = "*.apk or an exact asset name", .width = CUI_GROW(1),
-                  .disabled = running);
-        if (cui_button(ui, "Add", .icon = CUI_ICON_PLUS, .disabled = running)) {
-            add_selection(s, r);
-        }
-    }
-
-    if (r->asset_count == 0) {
-        cui_muted(ui, "No selections for this repository.");
-        return;
-    }
-
-    cui_scroll(ui, .id = "selections", .width = CUI_FILL, .height = CUI_GROW(1), .gap = 8,
-               .pad = 2) {
-        for (int i = 0; i < r->asset_count; i++) {
-            katoshe_asset *a = &r->assets[i];
-            int mode = a->mode == KATOSHE_MODE_ARCHIVE ? 1 : 0;
-            double keep = a->keep_versions > 0 ? (double)a->keep_versions : 3;
-            char status_key[KEY_LEN];
-
-            snprintf(status_key, sizeof status_key, "%s/%s", r->name, a->match);
-
-            cui_push_id_int(ui, i);
-            cui_card(ui, .width = CUI_FILL, .pad = 12, .gap = 8) {
-                cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
-                    cui_label(ui, a->match);
-                    for (int k = 0; k < v->status_count; k++) {
-                        if (strcmp(v->status[k].key, status_key) == 0 &&
-                            v->status[k].action >= 0) {
-                            cui_badge(ui, katoshe_plan_action_name((plan_action)v->status[k].action),
-                                      .tone = v->status[k].action == PLAN_MISSING
-                                                  ? CUI_TONE_DANGER
-                                                  : (v->status[k].action == PLAN_UNCHANGED
-                                                         ? CUI_TONE_SUCCESS
-                                                         : CUI_TONE_INFO));
+                cui_card(ui, .width = CUI_FILL, .pad = 12, .gap = 8) {
+                    cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_CENTER) {
+                        cui_label(ui, a->match);
+                        for (int k = 0; k < v->status_count; k++) {
+                            if (strcmp(v->status[k].key, status_key) == 0 &&
+                                v->status[k].action >= 0) {
+                                cui_badge(ui, katoshe_plan_action_name((plan_action)v->status[k].action),
+                                          .tone = v->status[k].action == PLAN_MISSING
+                                                      ? CUI_TONE_DANGER
+                                                      : (v->status[k].action == PLAN_UNCHANGED
+                                                             ? CUI_TONE_SUCCESS
+                                                             : CUI_TONE_INFO));
+                            }
+                        }
+                        cui_spacer(ui);
+                        if (cui_icon_button(ui, CUI_ICON_TRASH_2, .variant = CUI_BUTTON_GHOST,
+                                            .tooltip = "Remove this selection",
+                                            .disabled = running)) {
+                            remove_sel = i;
                         }
                     }
-                    cui_spacer(ui);
-                    if (cui_icon_button(ui, CUI_ICON_TRASH_2, .variant = CUI_BUTTON_GHOST,
-                                        .tooltip = "Remove this selection",
-                                        .disabled = running)) {
-                        remove_sel = i;
-                    }
-                }
-                cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
-                    if (cui_input(ui, "match", a->match, sizeof a->match, .label = "Match",
-                                  .width = CUI_GROW(1), .disabled = running)) {
-                        s->dirty = 1;
-                    }
-                    if (cui_input(ui, "filename", a->filename, sizeof a->filename,
-                                  .label = "File name", .placeholder = "remote name",
-                                  .width = CUI_PX(240), .hint = "replace mode only",
-                                  .disabled = running)) {
-                        s->dirty = 1;
-                    }
-                }
-                cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
-                    if (cui_input(ui, "dir", a->dir, sizeof a->dir, .label = "Subdirectory",
-                                  .placeholder = "repository directory", .width = CUI_GROW(1),
-                                  .disabled = running)) {
-                        s->dirty = 1;
-                    }
-                    if (cui_select(ui, "mode", mode_names, 2, &mode, .label = "Mode",
-                                   .width = CUI_PX(140), .disabled = running)) {
-                        a->mode = mode == 1 ? KATOSHE_MODE_ARCHIVE : KATOSHE_MODE_REPLACE;
-                        s->dirty = 1;
-                    }
-                    if (mode == 1) {
-                        if (cui_number(ui, "keep", &keep, 1, 99, .label = "Versions to keep",
-                                       .width = CUI_PX(150), .disabled = running)) {
-                            a->keep_versions = (int)keep;
+                    cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
+                        if (cui_input(ui, "match", a->match, sizeof a->match, .label = "Match",
+                                      .width = CUI_GROW(1), .disabled = running)) {
+                            s->dirty = 1;
+                        }
+                        if (cui_input(ui, "filename", a->filename, sizeof a->filename,
+                                      .label = "File name", .placeholder = "remote name",
+                                      .width = CUI_PX(240), .hint = "replace mode only",
+                                      .disabled = running)) {
                             s->dirty = 1;
                         }
                     }
+                    cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
+                        if (cui_input(ui, "dir", a->dir, sizeof a->dir, .label = "Subdirectory",
+                                      .placeholder = "repository directory", .width = CUI_GROW(1),
+                                      .disabled = running)) {
+                            s->dirty = 1;
+                        }
+                        if (cui_select(ui, "mode", mode_names, 2, &mode, .label = "Mode",
+                                       .width = CUI_PX(140), .disabled = running)) {
+                            a->mode = mode == 1 ? KATOSHE_MODE_ARCHIVE : KATOSHE_MODE_REPLACE;
+                            s->dirty = 1;
+                        }
+                        if (mode == 1) {
+                            if (cui_number(ui, "keep", &keep, 1, 99, .label = "Versions to keep",
+                                           .width = CUI_PX(150), .disabled = running)) {
+                                a->keep_versions = (int)keep;
+                                s->dirty = 1;
+                            }
+                        }
+                    }
+                }
+                cui_pop_id(ui);
+
+                if (mode != a->mode) {
+                    a->mode = mode;
+                    s->dirty = 1;
                 }
             }
-            cui_pop_id(ui);
-
-            if (mode != a->mode) {
-                a->mode = mode;
-                s->dirty = 1;
-            }
         }
-    }
 
-    if (remove_sel >= 0) remove_selection(s, r, remove_sel);
+        if (remove_sel >= 0) remove_selection(s, r, remove_sel);
+    }
 }
 
 static const char *status_note(const gui_status *st) {

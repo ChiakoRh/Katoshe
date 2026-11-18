@@ -39,6 +39,15 @@ int katoshe_mkdir(const char *path) {
     return (GetLastError() == ERROR_ALREADY_EXISTS) ? 0 : -1;
 }
 
+/* "<cwd>\config" when it exists, for the working-directory fallback. */
+static int cwd_config_probe(char *out, size_t cap) {
+    char cwd[512];
+
+    if (GetCurrentDirectoryA((DWORD)sizeof cwd, cwd) == 0) return -1;
+    if (katoshe_path_join(out, cap, cwd, "config") != 0) return -1;
+    return GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES ? 0 : -1;
+}
+
 int katoshe_paths_init(katoshe_paths *p, const char *root_override, char *err, size_t errlen) {
     char exe[512];
     char probe[600];
@@ -60,6 +69,12 @@ int katoshe_paths_init(katoshe_paths *p, const char *root_override, char *err, s
         }
         if (GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES) {
             snprintf(p->base, sizeof p->base, "%s", exe);
+            p->portable = true;
+        } else if (cwd_config_probe(probe, sizeof probe) == 0) {
+            /* Started from a checkout (build\Release\katoshe.exe) or from a
+               folder the user keeps the config in: the working directory wins
+               over %APPDATA%, which would otherwise start on an empty preset. */
+            GetCurrentDirectoryA((DWORD)sizeof p->base, p->base);
             p->portable = true;
         } else {
             DWORD n = GetEnvironmentVariableW(L"APPDATA", wbuf,
