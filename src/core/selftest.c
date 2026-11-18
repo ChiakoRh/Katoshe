@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "gh.h"
 #include "paths.h"
 
 static int failures;
@@ -138,6 +139,48 @@ int katoshe_selftest(void) {
     put(a.settings, k_settings);
     put(a.default_preset, k_default_preset);
     put(a.other_preset, k_other_preset);
+
+    /* 0. URL forms users actually paste */
+    {
+        static const struct {
+            const char *in;
+            const char *owner;
+            const char *repo;
+        } urls[] = {
+            {"https://github.com/owner/repo", "owner", "repo"},
+            {"https://github.com/owner/repo.git", "owner", "repo"},
+            {"https://github.com/owner/repo/", "owner", "repo"},
+            {"http://www.github.com/owner/repo", "owner", "repo"},
+            {"git@github.com:owner/repo.git", "owner", "repo"},
+            {"owner/repo", "owner", "repo"},
+            {"github.com/owner/repo", "owner", "repo"},
+            {"https://api.github.com/repos/owner/repo", "owner", "repo"},
+            {NULL, NULL, NULL},
+        };
+        static const char *const bad[] = {
+            "https://gitlab.com/owner/repo",
+            "https://github.com/owner/repo/releases/tag/v1",
+            "https://github.com/onlyowner",
+            "owner",
+            "",
+            "https://github.com/../repo",
+            "https://github.com/owner/..",
+            NULL,
+        };
+        for (int i = 0; urls[i].in; i++) {
+            char owner[128], repo[128];
+            int ok = gh_parse_url(urls[i].in, owner, sizeof owner, repo, sizeof repo) == 0 &&
+                     strcmp(owner, urls[i].owner) == 0 && strcmp(repo, urls[i].repo) == 0;
+            if (!ok) printf("     (url case %d: %s)\n", i, urls[i].in);
+            check(ok, "url parses to owner/repo");
+        }
+        for (int i = 0; bad[i]; i++) {
+            char owner[128], repo[128];
+            int rejected = gh_parse_url(bad[i], owner, sizeof owner, repo, sizeof repo) != 0;
+            if (!rejected) printf("     (url case %d: %s)\n", i, bad[i]);
+            check(rejected, "bad url rejected");
+        }
+    }
 
     /* 1. every field parses, absent fields keep their default */
     check(katoshe_config_load(&cfg, a.settings, a.presets_dir, NULL, err, sizeof err) == 0,

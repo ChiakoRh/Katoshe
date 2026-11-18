@@ -23,6 +23,8 @@ add_library(katoshe_core STATIC
     src/core/paths.c
     src/core/config.c
     src/core/selftest.c
+    src/core/gh.c
+    src/core/secrets.c
     vendor/cjson/cJSON.c
 )
 target_include_directories(katoshe_core PUBLIC
@@ -32,7 +34,7 @@ target_include_directories(katoshe_core PUBLIC
 )
 target_compile_definitions(katoshe_core
     PUBLIC CURL_STATICLIB WIN32_LEAN_AND_MEAN NOMINMAX
-    PRIVATE KATOSHE_VERSION="${PROJECT_VERSION}"
+    PRIVATE KATOSHE_VERSION="${PROJECT_VERSION}" _CRT_SECURE_NO_WARNINGS
 )
 target_link_libraries(katoshe_core PUBLIC
     "${KATOSHE_CURL}/lib/libcurl.lib"
